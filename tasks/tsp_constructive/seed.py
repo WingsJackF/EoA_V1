@@ -1,0 +1,10 @@
+"""
+内联种子代码。
+"""
+
+SEED_CODE = 'import numpy as np\ndef select_next_node_v2(current_node: int, destination_node: int, unvisited_nodes: set, distance_matrix: np.ndarray) -> int:\n    """Select the next node using balanced, interpretable heuristics that prioritize local cost, diversity, and destination convergence."""\n    if len(unvisited_nodes) == 1:\n        return unvisited_nodes.pop()\n    \n    # Smooth, interpretable weights that favor local cost and diversity, while guiding toward destination\n    c_local = 0.6     # Strong preference for nearby nodes to reduce immediate cost\n    c_diversity = 0.3 # Encourage visiting nodes that explore new regions\n    c_convergence = 0.1 # Mild preference for nodes closer to destination for timely return\n    \n    scores = {}\n    \n    for node in unvisited_nodes:\n        # 1. Local cost: direct edge cost from current node\n        local_cost = distance_matrix[current_node][node]\n        \n        # 2. Diversity: encourage nodes that are neither too close nor too far from others (spread across unvisited nodes)\n        others = [n for n in unvisited_nodes if n != node]\n        if len(others) > 1:\n            distances_to_others = [distance_matrix[node][n] for n in others]\n            std_dist = np.std(distances_to_others)\n            diversity_score = std_dist\n        else:\n            diversity_score = 0\n        \n        # 3. Convergence: estimate of return cost from this node to destination\n        dist_to_dest = distance_matrix[node][destination_node]\n        \n        # Composite score: lower is better\n        # Lower local cost is better, higher diversity helps exploration, lower return cost is better\n        score = (\n            c_local * local_cost -\n            c_diversity * diversity_score +\n            c_convergence * dist_to_dest\n        )\n        \n        scores[node] = score\n    \n    # Select the node with the minimum score\n    return min(scores, key=scores.get)\n'
+
+
+def get_seed_code() -> str:
+    """返回内联的种子源码字符串。"""
+    return SEED_CODE.strip()
