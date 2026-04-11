@@ -180,7 +180,7 @@ def implement_post_request_and_retry(
     while attempt <= max_retries:
         try:
             if verbose:
-                print(
+                safe_print(
                     f"[POST] Attempt {attempt + 1}/{max_retries + 1} "
                     f"to {url} (timeout={req_timeout}s)"
                 )
@@ -189,6 +189,8 @@ def implement_post_request_and_retry(
 
             status = response.status_code
             if status == 200:
+                if verbose:
+                    safe_print(f"[POST] Success: status=200 from {url}")
                 # Return parsed JSON; let ValueError propagate if JSON is invalid.
                 return response.json()
             else:
@@ -202,7 +204,7 @@ def implement_post_request_and_retry(
 
                 msg = f"Non-200 response: status={status}, content={content_preview}"
                 if verbose:
-                    print(f"[POST] {msg}")
+                    safe_print(f"[POST] {msg}")
                 # Raise a requests.RequestException to be caught below and possibly retried
                 raise requests.RequestException(msg)
 
@@ -210,14 +212,14 @@ def implement_post_request_and_retry(
             # If we've exhausted retries, surface the exception
             if attempt >= max_retries:
                 if verbose:
-                    print("[POST] All retries exhausted. Raising exception.")
+                    safe_print("[POST] All retries exhausted. Raising exception.")
                 # Surface the last encountered requests.RequestException
                 raise req_err
             # Otherwise, backoff and retry
             backoff = base_backoff * (2 ** attempt)
             if verbose:
-                print(f"[POST] Request failed (attempt {attempt + 1}). "
-                      f"Error: {req_err}. Backing off {backoff:.2f}s before retry.")
+                safe_print(f"[POST] Request failed (attempt {attempt + 1}). "
+                           f"Error: {req_err}. Backing off {backoff:.2f}s before retry.")
             time.sleep(backoff)
             attempt += 1
 

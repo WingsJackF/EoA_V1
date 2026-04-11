@@ -31,6 +31,8 @@ def build_prompt_strategies(assets: Dict[str, str]) -> Dict[str, Callable[..., T
             "",
             "## Required signature template",
             assets.get("func_signature", ""),
+            "Use the exact function name from the seed implementation or template-compatible canonical name only.",
+            "Do not invent new suffixes such as v4, v5, or custom entrypoint names.",
             "",
             "## Reference seed implementation",
             "```python",
@@ -46,14 +48,15 @@ def build_prompt_strategies(assets: Dict[str, str]) -> Dict[str, Callable[..., T
         return (
             "\n\nResponse format (required):\n"
             "Strategic Thought: <one or two sentences>\n\n"
-            "```python\n# full runnable code\n```\n"
+            "```python\n# full runnable code using the required function name\n```\n"
         )
 
     def modification(parent_individual: Dict[str, str]) -> Tuple[str, str]:
         system = (
             "You are an expert in combinatorial optimization and Python. "
             "Improve the given heuristic/operator code with targeted, verifiable changes. "
-            "Preserve the core idea unless clearly inferior."
+            "Preserve the core idea unless clearly inferior. "
+            "Keep the function name compatible with the seed/template; do not invent new version numbers."
         )
         thought = parent_individual.get("thought") or "(none)"
         code = parent_individual.get("code") or ""
@@ -71,7 +74,8 @@ def build_prompt_strategies(assets: Dict[str, str]) -> Dict[str, Callable[..., T
     def exploration(parents: List[Dict[str, str]]) -> Tuple[str, str]:
         system = (
             "You are an expert in combinatorial optimization. **Synthesize** novel code from multiple parents, "
-            "merging strengths; avoid trivial stitching."
+            "merging strengths; avoid trivial stitching. "
+            "Keep the function name compatible with the seed/template; do not invent new version numbers."
         )
         parts = [problem_block, "\n## Parents for synthesis\n"]
         for i, p in enumerate(parents, start=1):
@@ -81,7 +85,8 @@ def build_prompt_strategies(assets: Dict[str, str]) -> Dict[str, Callable[..., T
 
     def simplification(parent_individual: Dict[str, str]) -> Tuple[str, str]:
         system = (
-            "You simplify optimization code: shorter, clearer, numerically stable, same or better behavior."
+            "You simplify optimization code: shorter, clearer, numerically stable, same or better behavior. "
+            "Keep the function name compatible with the seed/template; do not invent new version numbers."
         )
         thought = parent_individual.get("thought") or "(none)"
         code = parent_individual.get("code") or ""

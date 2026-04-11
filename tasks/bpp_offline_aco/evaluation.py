@@ -18,9 +18,9 @@ POSSIBLE_NAMES = ("heuristics", "heuristics_v1", "heuristics_v2", "heuristics_v3
 def _wrap(ok: Callable[[], Any]) -> Dict[str, Any]:
     try:
         raw = ok()
-        return {"min_max_ratio": 0.0, "combined_score": float(raw), "eval_time": 0.0, "error": None}
+        return {"combined_score": float(raw), "eval_time": 0.0, "error": None}
     except Exception as e:
-        return {"min_max_ratio": 0.0, "combined_score": 0.0, "eval_time": 0.0, "error": str(e)}
+        return {"combined_score": 0.0, "eval_time": 0.0, "error": str(e)}
 
 
 def run_evaluation(program_code: str) -> Dict[str, Any]:

@@ -10,6 +10,7 @@ except:
     from gpt import heuristics
 
 
+IMPL_REEVO = True
 USE_HEURISTIC_BIAS = True
 
 def seed_heuristics(distance_matrix: torch.Tensor) -> torch.Tensor:

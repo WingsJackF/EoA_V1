@@ -19,13 +19,12 @@ def _wrap(ok: Callable[[], Any]) -> Dict[str, Any]:
     try:
         raw = ok()
         return {
-            "min_max_ratio": 0.0,
             "combined_score": float(raw),
             "eval_time": 0.0,
             "error": None,
         }
     except Exception as e:
-        return {"min_max_ratio": 0.0, "combined_score": 0.0, "eval_time": 0.0, "error": str(e)}
+        return {"combined_score": 0.0, "eval_time": 0.0, "error": str(e)}
 
 
 def _eval_instance(select_next_node: Callable[..., Any], node_positions: np.ndarray) -> float:

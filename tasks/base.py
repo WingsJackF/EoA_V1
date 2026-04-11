@@ -3,32 +3,29 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Tuple
 
+from tasks.task_support.text_utils import ensure_target_function_name
+
 # 个体字典约定：thought, code, fitness（至少含 combined_score 供选择器使用）
 Individual = Dict[str, Any]
 PromptStrategies = Dict[str, Callable[..., Tuple[str, str]]]
+FAILED_COMBINED_SCORE = -1e18
 
 
 def normalize_standard_fitness(result: Any) -> Dict[str, Any]:
-    """将评估器返回结果规范为含 min_max_ratio / combined_score / eval_time / error。"""
+    """将评估器返回结果规范为含 combined_score / eval_time / error，并保留任务特有字段。"""
     normalized: Dict[str, Any] = {
-        "min_max_ratio": 0.0,
-        "combined_score": 0.0,
+        "combined_score": FAILED_COMBINED_SCORE,
         "eval_time": 0.0,
         "error": None,
     }
     if not isinstance(result, dict):
         normalized["error"] = "Evaluator returned non-dict result."
         return normalized
-    if "min_max_ratio" in result:
-        try:
-            normalized["min_max_ratio"] = float(result.get("min_max_ratio", 0.0))
-        except (TypeError, ValueError):
-            normalized["min_max_ratio"] = 0.0
     if "combined_score" in result:
         try:
             normalized["combined_score"] = float(result.get("combined_score", 0.0))
         except (TypeError, ValueError):
-            normalized["combined_score"] = 0.0
+            normalized["combined_score"] = FAILED_COMBINED_SCORE
     if "eval_time" in result:
         try:
             normalized["eval_time"] = float(result.get("eval_time", 0.0))
@@ -36,11 +33,29 @@ def normalize_standard_fitness(result: Any) -> Dict[str, Any]:
             normalized["eval_time"] = 0.0
     if result.get("error") is not None:
         normalized["error"] = str(result.get("error"))
-    elif normalized["combined_score"] == 0.0 and normalized["min_max_ratio"] == 0.0:
+        normalized["combined_score"] = FAILED_COMBINED_SCORE
+    elif normalized["combined_score"] == 0.0:
         alt = result.get("message") or result.get("msg") or result.get("exception")
         if alt:
             normalized["error"] = str(alt)
+            normalized["combined_score"] = FAILED_COMBINED_SCORE
+    for key, value in result.items():
+        if key not in normalized:
+            normalized[key] = value
     return normalized
+
+
+def fitness_has_error(fitness: Any) -> bool:
+    if not isinstance(fitness, dict):
+        return True
+    err = fitness.get("error")
+    return err is not None and str(err).strip() != ""
+
+
+def individual_is_valid(individual: Any) -> bool:
+    if not isinstance(individual, dict):
+        return False
+    return not fitness_has_error(individual.get("fitness", {}))
 
 
 class EvolutionTask(ABC):
@@ -66,6 +81,9 @@ class EvolutionTask(ABC):
     def evaluate(self, code: str) -> Dict[str, Any]:
         return normalize_standard_fitness(self.evaluate_raw(code))
 
+    def run_full_test(self, code: str, *, mode: str = "test") -> Dict[str, Any]:
+        raise NotImplementedError(f"Task `{self.id}` does not support full test mode.")
+
     def validate_syntax(self, code: str) -> None:
         from implement_llm_interaction_module.implement_response_parser import validate_constructor_syntax
 
@@ -74,9 +92,13 @@ class EvolutionTask(ABC):
     def extract_thought_and_code(self, llm_response: str) -> Dict[str, str]:
         from implement_llm_interaction_module.implement_response_parser import extract_thought_and_code_sections
 
-        return extract_thought_and_code_sections(
+        sections = extract_thought_and_code_sections(
             llm_response, target_function_name=self.target_function_name
         )
+        code = sections.get("code", "")
+        if code:
+            sections["code"] = ensure_target_function_name(code, self.target_function_name)
+        return sections
 
     @property
     @abstractmethod

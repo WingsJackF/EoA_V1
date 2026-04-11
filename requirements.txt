@@ -1,0 +1,19 @@
+# Python 3.10+
+
+# Core runtime dependencies
+numpy>=1.24
+scipy>=1.10
+requests>=2.31,<3
+
+# Bundled task dependencies
+# Note: `torch` is imported by several registered tasks during startup.
+# For CUDA-specific installs, you may want to replace this with the
+# platform-specific command from https://pytorch.org/get-started/locally/
+torch>=2.1
+tqdm>=4.66
+matplotlib>=3.7
+pytz>=2023.3
+numba>=0.58
+
+# Optional utility / dataset-generation dependency
+# ortools>=9.8

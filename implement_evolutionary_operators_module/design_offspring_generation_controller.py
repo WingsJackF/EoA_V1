@@ -246,13 +246,21 @@ Constraints:
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List
+import time
+
+from run_output_recorder import log_code_run_finish, log_code_run_start
+from tasks.base import FAILED_COMBINED_SCORE
 
 if TYPE_CHECKING:
     from tasks.base import EvolutionTask
 
 
 def collect_and_integrate_offspring_results(
-    raw_offspring_contents: List[str], task: "EvolutionTask"
+    raw_offspring_contents: List[str],
+    task: "EvolutionTask",
+    *,
+    iteration: int = 0,
+    code_index_start: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Processes LLM-generated offspring, evaluates, and formats them.
@@ -276,15 +284,24 @@ def collect_and_integrate_offspring_results(
     evaluated_individuals: List[Dict[str, Any]] = []
 
     for idx, raw_content in enumerate(raw_offspring_contents):
+        code_index = code_index_start + idx
         # Prepare a default failure fitness template
         failure_fitness = {
-            "min_max_ratio": 0.0,
-            "combined_score": 0.0,
+            "combined_score": FAILED_COMBINED_SCORE,
             "eval_time": 0.0,
             "error": None
         }
 
         if not isinstance(raw_content, str):
+            log_code_run_start(iteration, code_index, phase="offspring")
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=0.0,
+                error="Raw offspring content is not a string",
+                phase="offspring",
+            )
             individual = {
                 "thought": "",
                 "code": "",
@@ -293,24 +310,47 @@ def collect_and_integrate_offspring_results(
             evaluated_individuals.append(individual)
             continue
 
+        eval_start = time.perf_counter()
+        log_code_run_start(iteration, code_index, phase="offspring")
+
         # 1) Extract thought and code
         try:
             sections = task.extract_thought_and_code(raw_content)
             thought = sections.get("thought", "").strip()
             code = sections.get("code", "").strip()
         except ValueError as ve:
+            elapsed = time.perf_counter() - eval_start
+            error = f"Extraction failed: {str(ve)}"
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="offspring",
+            )
             individual = {
                 "thought": "",
                 "code": "",
-                "fitness": {**failure_fitness, "error": f"Extraction failed: {str(ve)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             evaluated_individuals.append(individual)
             continue
         except TypeError as te:
+            elapsed = time.perf_counter() - eval_start
+            error = f"Extraction TypeError: {str(te)}"
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="offspring",
+            )
             individual = {
                 "thought": "",
                 "code": "",
-                "fitness": {**failure_fitness, "error": f"Extraction TypeError: {str(te)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             evaluated_individuals.append(individual)
             continue
@@ -319,26 +359,56 @@ def collect_and_integrate_offspring_results(
         try:
             task.validate_syntax(code)
         except SyntaxError as se:
+            elapsed = time.perf_counter() - eval_start
+            error = f"SyntaxError: {str(se)}"
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="offspring",
+            )
             individual = {
                 "thought": thought,
                 "code": code,
-                "fitness": {**failure_fitness, "error": f"SyntaxError: {str(se)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             evaluated_individuals.append(individual)
             continue
         except ValueError as ve:
+            elapsed = time.perf_counter() - eval_start
+            error = f"Validation Error: {str(ve)}"
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="offspring",
+            )
             individual = {
                 "thought": thought,
                 "code": code,
-                "fitness": {**failure_fitness, "error": f"Validation Error: {str(ve)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             evaluated_individuals.append(individual)
             continue
         except TypeError as te:
+            elapsed = time.perf_counter() - eval_start
+            error = f"Validation TypeError: {str(te)}"
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="offspring",
+            )
             individual = {
                 "thought": thought,
                 "code": code,
-                "fitness": {**failure_fitness, "error": f"Validation TypeError: {str(te)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             evaluated_individuals.append(individual)
             continue
@@ -346,15 +416,47 @@ def collect_and_integrate_offspring_results(
         # 3) Evaluate the code using task-bound evaluator
         try:
             fitness = task.evaluate(code)
+            elapsed = time.perf_counter() - eval_start
             if not isinstance(fitness, dict):
-                fitness = {**failure_fitness, "error": "Evaluator returned non-dict result"}
+                fitness = {**failure_fitness, "eval_time": elapsed, "error": "Evaluator returned non-dict result"}
             else:
                 if "error" not in fitness:
                     fitness["error"] = None
+                try:
+                    if float(fitness.get("eval_time", 0.0)) <= 0.0:
+                        fitness["eval_time"] = elapsed
+                except (TypeError, ValueError):
+                    fitness["eval_time"] = elapsed
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=not bool(fitness.get("error")),
+                elapsed=elapsed,
+                fitness=fitness,
+                phase="offspring",
+            )
         except ImportError as ie:
-            fitness = {**failure_fitness, "error": f"Evaluator import error: {str(ie)}"}
+            elapsed = time.perf_counter() - eval_start
+            fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator import error: {str(ie)}"}
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=elapsed,
+                fitness=fitness,
+                phase="offspring",
+            )
         except TypeError as te:
-            fitness = {**failure_fitness, "error": f"Evaluator TypeError: {str(te)}"}
+            elapsed = time.perf_counter() - eval_start
+            fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator TypeError: {str(te)}"}
+            log_code_run_finish(
+                iteration,
+                code_index,
+                success=False,
+                elapsed=elapsed,
+                fitness=fitness,
+                phase="offspring",
+            )
         # Note: Do not catch arbitrary Exception per module constraints.
 
         individual = {

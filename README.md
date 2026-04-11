@@ -175,6 +175,7 @@ python main.py --task min_max_layout_16 --llm-concurrency 4
 python main.py --task tsp_aco --llm-concurrency 2
 python main.py --task bpp_online --llm-concurrency 2
 python main.py --task dpp_ga --llm-concurrency 2
+python main.py --task tsp_pomo --gpu 1 --llm-concurrency 1
 ```
 
 ### 5.4 常用参数
@@ -186,6 +187,10 @@ python main.py --task dpp_ga --llm-concurrency 2
 - `--llm-model`：覆盖 `LLM_MODEL`
 - `--llm-timeout`：覆盖请求超时
 - `--llm-concurrency`：并发请求数
+- `--gpu`：指定物理 GPU 编号，如 `--gpu 1`
+- `--full-test`：演化完成后，对最终最优个体再跑一次完整测试
+- `--full-test-mode`：完整测试配置，`val` 或 `test`，默认 `test`
+- `--test-code PATH`：跳过演化，直接对某个 `.py` 候选代码跑完整测试
 - `--no-run-output`：不写入 `output/`
 
 ### 5.5 输出结果位置
@@ -202,6 +207,8 @@ output/<task_id>/<timestamp>/
 - `run_meta.json`：本次运行元信息
 - `evolution/generation_*.json`：每代快照
 - `final_archive.json`：最终 archive
+- `best_code.py`：最终 archive 第一名对应的代码文件
+- `final_test.json`：`--full-test` 时保存的完整测试结果
 
 ---
 
@@ -300,4 +307,3 @@ python main.py --task min_max_layout_16 --llm-concurrency 1
 - `.env`
 - `output/`
 - 任意真实 API key
-

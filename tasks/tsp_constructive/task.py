@@ -61,8 +61,8 @@ class TspConstructiveTask(EvolutionTask):
                 "\n```\n\nInstruction: ",
                 diversity_instruction,
                 "\n\nRespond with Strategic Thought and one ```python``` block with complete runnable code "
-                f"(imports allowed), defining the evolved function like `{self.target_function_name}` "
-                "or a versioned variant consistent with the seed.",
+                f"(imports allowed), defining the evolved function exactly as `{self.target_function_name}`. "
+                "Do not invent new names or new version suffixes.",
             ]
         )
 

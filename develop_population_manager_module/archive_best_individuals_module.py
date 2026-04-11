@@ -22,6 +22,8 @@ Constraints:
 from typing import List, Dict, Any, Tuple
 import copy
 
+from tasks.base import fitness_has_error
+
 
 def _extract_combined_score(ind: Dict[str, Any]) -> float:
     """
@@ -39,21 +41,13 @@ def _extract_combined_score(ind: Dict[str, Any]) -> float:
         return 0.0
 
 
-def _fitness_has_error(ind: Dict[str, Any]) -> bool:
-    fitness = ind.get("fitness", {})
-    if not isinstance(fitness, dict):
-        return True
-    err = fitness.get("error")
-    return err is not None and str(err).strip() != ""
-
-
 def _archive_sort_key(ind: Dict[str, Any]) -> Tuple[float, int]:
     """主键 combined_score 降序；同分优先无 error。"""
     try:
         score = _extract_combined_score(ind)
     except KeyError:
         score = 0.0
-    has_error = 1 if _fitness_has_error(ind) else 0
+    has_error = 1 if fitness_has_error(ind.get("fitness", {})) else 0
     return (score, -has_error)
 
 
@@ -86,7 +80,11 @@ def archive_best_individuals(
     if max_archive_size <= 0:
         raise ValueError("max_archive_size must be a positive integer")
 
-    combined = list(archive) + list(new_candidates)
+    combined = [
+        ind
+        for ind in (list(archive) + list(new_candidates))
+        if isinstance(ind, dict) and not fitness_has_error(ind.get("fitness", {}))
+    ]
 
     # Deduplicate by (thought, code). Keep the version with the highest combined_score.
     unique_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -119,7 +117,7 @@ def archive_best_individuals(
                 existing_cs = 0.0
             if cs > existing_cs:
                 unique_map[key] = ind
-            elif cs == existing_cs and _fitness_has_error(existing) and not _fitness_has_error(ind):
+            elif cs == existing_cs and fitness_has_error(existing.get("fitness", {})) and not fitness_has_error(ind.get("fitness", {})):
                 unique_map[key] = ind
 
     unique_list = list(unique_map.values())
@@ -130,6 +128,5 @@ def archive_best_individuals(
 
     # Return deep copies to prevent downstream modification
     return [copy.deepcopy(ind) for ind in trimmed]
-
 
 

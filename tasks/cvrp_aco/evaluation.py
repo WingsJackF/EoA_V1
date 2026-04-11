@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict
 import numpy as np
 from scipy.spatial import distance_matrix
 
+from tasks.task_support.gpu import solver_device
 from tasks.task_support.paths import problem_dir
 from tasks.task_support.runtime import import_problem_module, load_program_module, resolve_callable
 
@@ -21,9 +22,9 @@ POSSIBLE_NAMES = ("heuristics", "heuristics_v1", "heuristics_v2", "heuristics_v3
 def _wrap(ok: Callable[[], Any]) -> Dict[str, Any]:
     try:
         raw = ok()
-        return {"min_max_ratio": 0.0, "combined_score": float(raw), "eval_time": 0.0, "error": None}
+        return {"combined_score": float(raw), "eval_time": 0.0, "error": None}
     except Exception as e:
-        return {"min_max_ratio": 0.0, "combined_score": 0.0, "eval_time": 0.0, "error": str(e)}
+        return {"combined_score": 0.0, "eval_time": 0.0, "error": str(e)}
 
 
 def run_evaluation(program_code: str) -> Dict[str, Any]:
@@ -50,7 +51,14 @@ def run_evaluation(program_code: str) -> Dict[str, Any]:
             else:
                 raise TypeError(f"Unsupported heuristic signature with {n_args} args")
             heu[heu < 1e-9] = 1e-9
-            solver = aco_mod.ACO(dist_mat, demands[i], heu, CAPACITY, n_ants=N_ANTS)
+            solver = aco_mod.ACO(
+                dist_mat,
+                demands[i],
+                heu,
+                CAPACITY,
+                n_ants=N_ANTS,
+                device=solver_device(),
+            )
             obj = solver.run(N_ITERATIONS)
             objs.append(float(obj.item() if hasattr(obj, "item") else obj))
         return -float(np.mean(objs))

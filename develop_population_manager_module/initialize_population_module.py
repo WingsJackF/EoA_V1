@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any, Dict, List
 if TYPE_CHECKING:
     from tasks.base import EvolutionTask
 
+from tasks.base import FAILED_COMBINED_SCORE
+
 
 def _fallback_validate_constructor_syntax(code_str: str, function_name: str = "_entrypoint") -> None:
     """
@@ -118,6 +120,8 @@ def add_seed_individual(task: EvolutionTask) -> Dict[str, Any]:
 
     seed_code = task.seed_code
     seed_thought = task.seed_thought
+    eval_start = time.perf_counter()
+    log_code_run_start(0, 0, phase="seed")
 
     try:
         task.validate_syntax(seed_code)
@@ -125,6 +129,21 @@ def add_seed_individual(task: EvolutionTask) -> Dict[str, Any]:
         _fallback_validate_constructor_syntax(seed_code, function_name=task.target_function_name)
 
     fitness_result = task.evaluate(seed_code)
+    elapsed = time.perf_counter() - eval_start
+    try:
+        if float(fitness_result.get("eval_time", 0.0)) <= 0.0:
+            fitness_result["eval_time"] = elapsed
+    except (TypeError, ValueError, AttributeError):
+        pass
+    log_code_run_finish(
+        0,
+        0,
+        success=not bool(fitness_result.get("error")) if isinstance(fitness_result, dict) else False,
+        elapsed=elapsed,
+        fitness=fitness_result if isinstance(fitness_result, dict) else None,
+        error=None if isinstance(fitness_result, dict) else "Seed evaluator returned non-dict result",
+        phase="seed",
+    )
 
     return {
         "thought": seed_thought,
@@ -164,6 +183,9 @@ Notes:
 
 import random
 import requests  # used to reference requests.RequestException in exception handling
+import time
+
+from run_output_recorder import log_code_run_finish, log_code_run_start
 
 
 def generate_diverse_initial_individuals(
@@ -224,11 +246,10 @@ def generate_diverse_initial_individuals(
         max_concurrency=max_concurrency,
     )
 
-    for response_result in response_results:
+    for response_index, response_result in enumerate(response_results):
         # Default fitness placeholder in case of failure during generation/eval
         failure_fitness = {
-            "min_max_ratio": 0.0,
-            "combined_score": 0.0,
+            "combined_score": FAILED_COMBINED_SCORE,
             "eval_time": 0.0,
             "error": None
         }
@@ -250,6 +271,15 @@ def generate_diverse_initial_individuals(
             # Navigate typical response structure
             raw_content = response_json["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as key_err:
+            log_code_run_start(0, response_index, phase="initial")
+            log_code_run_finish(
+                0,
+                response_index,
+                success=False,
+                elapsed=0.0,
+                error=f"Unexpected LLM response structure: {str(key_err)}",
+                phase="initial",
+            )
             individual = {
                 "thought": "",
                 "code": "",
@@ -258,16 +288,29 @@ def generate_diverse_initial_individuals(
             diverse_individuals.append(individual)
             continue
 
+        eval_start = time.perf_counter()
+        log_code_run_start(0, response_index, phase="initial")
+
         # Extract thought and code
         try:
             sections = task.extract_thought_and_code(raw_content)
             thought_text = sections.get("thought", "").strip()
             code_text = sections.get("code", "").strip()
         except (ValueError, TypeError) as parse_err:
+            elapsed = time.perf_counter() - eval_start
+            error = f"Parsing failed: {str(parse_err)}"
+            log_code_run_finish(
+                0,
+                response_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="initial",
+            )
             individual = {
                 "thought": "",
                 "code": raw_content[:1000],
-                "fitness": {**failure_fitness, "error": f"Parsing failed: {str(parse_err)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             diverse_individuals.append(individual)
             continue
@@ -276,18 +319,38 @@ def generate_diverse_initial_individuals(
         try:
             task.validate_syntax(code_text)
         except SyntaxError as se:
+            elapsed = time.perf_counter() - eval_start
+            error = f"SyntaxError: {str(se)}"
+            log_code_run_finish(
+                0,
+                response_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="initial",
+            )
             individual = {
                 "thought": thought_text,
                 "code": code_text,
-                "fitness": {**failure_fitness, "error": f"SyntaxError: {str(se)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             diverse_individuals.append(individual)
             continue
         except ValueError as ve:
+            elapsed = time.perf_counter() - eval_start
+            error = f"Validation Error: {str(ve)}"
+            log_code_run_finish(
+                0,
+                response_index,
+                success=False,
+                elapsed=elapsed,
+                error=error,
+                phase="initial",
+            )
             individual = {
                 "thought": thought_text,
                 "code": code_text,
-                "fitness": {**failure_fitness, "error": f"Validation Error: {str(ve)}"}
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
             }
             diverse_individuals.append(individual)
             continue
@@ -295,12 +358,47 @@ def generate_diverse_initial_individuals(
         # Evaluate using task-bound evaluator
         try:
             fitness = task.evaluate(code_text)
+            elapsed = time.perf_counter() - eval_start
             if not isinstance(fitness, dict):
-                fitness = {**failure_fitness, "error": "Evaluator returned non-dict result"}
+                fitness = {**failure_fitness, "eval_time": elapsed, "error": "Evaluator returned non-dict result"}
+            else:
+                if "error" not in fitness:
+                    fitness["error"] = None
+                try:
+                    if float(fitness.get("eval_time", 0.0)) <= 0.0:
+                        fitness["eval_time"] = elapsed
+                except (TypeError, ValueError):
+                    fitness["eval_time"] = elapsed
+            log_code_run_finish(
+                0,
+                response_index,
+                success=not bool(fitness.get("error")),
+                elapsed=elapsed,
+                fitness=fitness,
+                phase="initial",
+            )
         except ImportError as ie:
-            fitness = {**failure_fitness, "error": f"Evaluator import failed: {str(ie)}"}
+            elapsed = time.perf_counter() - eval_start
+            fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator import failed: {str(ie)}"}
+            log_code_run_finish(
+                0,
+                response_index,
+                success=False,
+                elapsed=elapsed,
+                fitness=fitness,
+                phase="initial",
+            )
         except TypeError as te:
-            fitness = {**failure_fitness, "error": f"Evaluator TypeError: {str(te)}"}
+            elapsed = time.perf_counter() - eval_start
+            fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator TypeError: {str(te)}"}
+            log_code_run_finish(
+                0,
+                response_index,
+                success=False,
+                elapsed=elapsed,
+                fitness=fitness,
+                phase="initial",
+            )
         # Note: We do not catch broad Exception per module constraints
 
         individual = {

@@ -5,6 +5,27 @@ project_root = os.path.abspath(os.path.join(current_dir, ".."))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 sys.path.append(project_root)
+
+
+def _extract_gpu_arg(argv: list[str]) -> int | None:
+    for idx, arg in enumerate(argv):
+        if arg != "--gpu":
+            continue
+        if idx + 1 >= len(argv):
+            return None
+        try:
+            return int(argv[idx + 1])
+        except ValueError:
+            return None
+    return None
+
+
+_early_gpu_arg = _extract_gpu_arg(sys.argv[1:])
+if _early_gpu_arg is not None:
+    os.environ["EOA_USE_CUDA"] = "1"
+    os.environ["EOA_VISIBLE_GPU"] = str(_early_gpu_arg)
+    os.environ["EOA_CUDA_DEVICE_NUM"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(_early_gpu_arg)
 r"""
 Main executable for the task-pluggable evolutionary LLM+GP system.
 
@@ -32,7 +53,7 @@ from develop_population_manager_module.initialize_population_module import (
     generate_diverse_initial_individuals,
 )
 from tasks import get_task, list_tasks
-from tasks.base import EvolutionTask
+from tasks.base import EvolutionTask, individual_is_valid
 from develop_population_manager_module.archive_best_individuals_module import archive_best_individuals
 from develop_population_manager_module.select_parents_and_offspring_module import (
     implement_elitism_selection,
@@ -48,9 +69,12 @@ from implement_llm_interaction_module.develop_api_wrapper import (
     safe_print,
 )
 from implement_llm_interaction_module.llm_config import configure_llm, get_llm_settings
+from tasks.task_support.gpu import configure_gpu_environment, gpu_requested, visible_gpu
 from run_output_recorder import (
     make_run_output_dir,
+    save_code_artifact,
     save_final_archive,
+    save_final_test_result,
     save_generation_snapshot,
     tee_terminal_to_file,
     write_run_meta,
@@ -86,6 +110,13 @@ def _log_llm_settings() -> None:
     )
 
 
+def _log_runtime_settings() -> None:
+    if gpu_requested():
+        safe_print(f"GPU selection: physical GPU {visible_gpu()} (mapped to cuda:0)")
+    else:
+        safe_print("GPU selection: CPU/default device")
+
+
 def _summarize_individual(ind: Dict[str, Any]) -> str:
     """Return a concise string summarizing an individual for logging."""
     cs = None
@@ -102,7 +133,7 @@ def main(
     *,
     output_run_dir: Optional[Path] = None,
     llm_concurrency: int = DEFAULT_LLM_CONCURRENCY,
-) -> None:
+) -> List[Dict[str, Any]]:
     """
     Main evolutionary loop orchestration.
     """
@@ -111,6 +142,7 @@ def main(
         safe_print(f"Run output directory: {output_run_dir.resolve()}")
     safe_print(f"Task: {task.id} (entry: {task.target_function_name})")
     _log_llm_settings()
+    _log_runtime_settings()
     if llm_concurrency <= 0:
         raise ValueError("llm_concurrency must be a positive integer")
     safe_print(f"Initializing population with seed individual (llm_concurrency={llm_concurrency})...")
@@ -118,7 +150,10 @@ def main(
         seed_ind = add_seed_individual(task)
     except (SyntaxError, ValueError, TypeError) as e:
         safe_print(f"Seed validation/evaluation failed: {e}")
-        return
+        return []
+    if not individual_is_valid(seed_ind):
+        safe_print(f"Seed evaluation returned an error; aborting run: {seed_ind.get('fitness', {}).get('error')}")
+        return []
 
     population: List[Dict[str, Any]] = [seed_ind]
     # Generate remaining individuals using the LLM interaction module
@@ -131,28 +166,50 @@ def main(
                 max_concurrency=llm_concurrency,
             )
             # Only append properly formatted dicts
+            skipped_generated = 0
             for ind in generated:
-                if isinstance(ind, dict):
+                if individual_is_valid(ind):
                     population.append(ind)
+                else:
+                    skipped_generated += 1
+            if skipped_generated:
+                safe_print(f"Skipped {skipped_generated} invalid generated individuals during initialization.")
+            fallback_offset = 0
+            max_fallback_attempts = max(POPULATION_SIZE, n_to_generate * 2)
+            while len(population) < POPULATION_SIZE and fallback_offset < max_fallback_attempts:
+                try:
+                    fallback = task.build_fallback_individual(fallback_offset)
+                except (TypeError, ImportError, ValueError, SyntaxError) as eval_err:
+                    safe_print(f"Fallback generation failed #{fallback_offset + 1}: {eval_err}")
+                    break
+                if individual_is_valid(fallback):
+                    population.append(fallback)
+                else:
+                    safe_print(
+                        f"Skipped invalid fallback individual #{fallback_offset + 1}: "
+                        f"{fallback.get('fitness', {}).get('error')}"
+                    )
+                fallback_offset += 1
+            if len(population) < POPULATION_SIZE:
+                safe_print(
+                    f"Initialization ended with {len(population)} valid individuals "
+                    f"(target={POPULATION_SIZE})."
+                )
         except ImportError as imp_err:
             safe_print(f"LLM generation module import failed: {imp_err}")
             # Fall back: let the task provide local fallback individuals.
             for s in range(n_to_generate):
                 try:
-                    population.append(task.build_fallback_individual(s))
+                    fallback = task.build_fallback_individual(s)
+                    if individual_is_valid(fallback):
+                        population.append(fallback)
+                    else:
+                        safe_print(
+                            f"Skipped invalid fallback individual #{s + 1}: "
+                            f"{fallback.get('fitness', {}).get('error')}"
+                        )
                 except (TypeError, ImportError, ValueError, SyntaxError) as eval_err:
-                    population.append(
-                        {
-                            "thought": f"Fallback generation failed #{s + 1}",
-                            "code": "",
-                            "fitness": {
-                                "min_max_ratio": 0.0,
-                                "combined_score": 0.0,
-                                "eval_time": 0.0,
-                                "error": str(eval_err),
-                            },
-                        }
-                    )
+                    safe_print(f"Fallback generation failed #{s + 1}: {eval_err}")
 
     safe_print(f"Initial population size: {len(population)}")
     for idx, ind in enumerate(population, start=1):
@@ -212,12 +269,16 @@ def main(
                 continue
             prepared_offspring_requests.append((off_idx, payload))
 
+        safe_print(
+            f"Dispatching {len(prepared_offspring_requests)} LLM requests for generation {gen} "
+            f"(llm_concurrency={llm_concurrency})..."
+        )
         request_results = implement_post_requests_concurrently(
             [payload for _, payload in prepared_offspring_requests],
             max_retries=5,
             base_backoff=2.0,
             timeout=30.0,
-            verbose=False,
+            verbose=True,
             max_concurrency=llm_concurrency,
         )
 
@@ -239,7 +300,12 @@ def main(
 
         # Integrate offspring: parse, validate, evaluate
         try:
-            evaluated_offspring = collect_and_integrate_offspring_results(offspring_raw_contents, task)
+            evaluated_offspring = collect_and_integrate_offspring_results(
+                offspring_raw_contents,
+                task,
+                iteration=gen,
+                code_index_start=0,
+            )
         except ImportError as ie:
             safe_print(f"Integration failed due to missing modules: {ie}")
             evaluated_offspring = []
@@ -247,12 +313,17 @@ def main(
             safe_print(f"Integration type error: {te}")
             evaluated_offspring = []
 
-        safe_print(f"Evaluated offspring count: {len(evaluated_offspring)}")
-        for idx, off in enumerate(evaluated_offspring, start=1):
+        valid_offspring = [off for off in evaluated_offspring if individual_is_valid(off)]
+        invalid_offspring_count = len(evaluated_offspring) - len(valid_offspring)
+        if invalid_offspring_count:
+            safe_print(f"Skipped {invalid_offspring_count} invalid offspring in generation {gen}.")
+
+        safe_print(f"Evaluated offspring count: {len(valid_offspring)}")
+        for idx, off in enumerate(valid_offspring, start=1):
             safe_print(f"  Offspring {idx}: {_summarize_individual(off)}")
 
         # Combine population and offspring for selection
-        combined_population = population + evaluated_offspring
+        combined_population = population + valid_offspring
 
         # Apply elitism: keep top ELITISM_COUNT
         try:
@@ -327,7 +398,8 @@ def main(
                 extra={
                     "strategies_used": strategies_used,
                     "offspring_raw_count": len(offspring_raw_contents),
-                    "offspring_evaluated_count": len(evaluated_offspring),
+                    "offspring_evaluated_count": len(valid_offspring),
+                    "offspring_failed_count": invalid_offspring_count,
                     "best_combined_score": best_combined_score,
                     "current_best_in_population": current_best,
                     "stagnation_count": stagnation_count,
@@ -349,6 +421,115 @@ def main(
 
     if output_run_dir is not None:
         save_final_archive(output_run_dir, archive)
+        if archive:
+            save_code_artifact(
+                output_run_dir,
+                filename="best_code.py",
+                code=archive[0].get("code", ""),
+            )
+    return archive
+
+
+def run_full_test_for_archive(
+    task: EvolutionTask,
+    archive: List[Dict[str, Any]],
+    *,
+    mode: str,
+    output_run_dir: Optional[Path],
+) -> Optional[Dict[str, Any]]:
+    if not archive:
+        safe_print("Skipping full test: archive is empty.")
+        return None
+    top_archived = archive[0]
+    safe_print(f"\n=== Running full {mode} test for archived best individual ===")
+    code = top_archived.get("code", "")
+    code_file: Optional[Path] = None
+    if output_run_dir is not None:
+        code_file = save_code_artifact(
+            output_run_dir,
+            filename="best_code.py",
+            code=code,
+        )
+    try:
+        full_test = task.run_full_test(code, mode=mode)
+    except NotImplementedError as e:
+        safe_print(str(e))
+        return None
+    payload: Dict[str, Any] = {
+        "task_id": task.id,
+        "target_function_name": task.target_function_name,
+        "mode": mode,
+        "archive_fitness": top_archived.get("fitness", {}),
+        "full_test": full_test,
+    }
+    if code_file is not None:
+        payload["code_file"] = str(code_file.resolve())
+    if full_test.get("error"):
+        safe_print(f"Full test failed: {full_test.get('error')}")
+    else:
+        for problem_size, metrics in full_test.get("problem_sizes", {}).items():
+            safe_print(
+                "  "
+                f"Problem size {problem_size}: "
+                f"teacher={metrics.get('teacher_score')}, "
+                f"student={metrics.get('student_score')}, "
+                f"gap={metrics.get('gap_percent')}%"
+            )
+        safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
+    if output_run_dir is not None:
+        save_final_test_result(output_run_dir, payload)
+        safe_print(f"Saved full test result to: {output_run_dir / 'final_test.json'}")
+    return payload
+
+
+def run_full_test_for_code_path(
+    task: EvolutionTask,
+    code_path: Path,
+    *,
+    mode: str,
+    output_run_dir: Optional[Path],
+) -> Optional[Dict[str, Any]]:
+    if not code_path.is_file():
+        raise FileNotFoundError(f"Code file not found: {code_path}")
+    code = code_path.read_text(encoding="utf-8")
+    safe_print(f"\n=== Running full {mode} test for code file: {code_path} ===")
+    copied_code_path: Optional[Path] = None
+    if output_run_dir is not None:
+        copied_code_path = save_code_artifact(
+            output_run_dir,
+            filename="tested_code.py",
+            code=code,
+        )
+    try:
+        full_test = task.run_full_test(code, mode=mode)
+    except NotImplementedError as e:
+        safe_print(str(e))
+        return None
+    payload: Dict[str, Any] = {
+        "task_id": task.id,
+        "target_function_name": task.target_function_name,
+        "mode": mode,
+        "source_code_path": str(code_path.resolve()),
+        "full_test": full_test,
+    }
+    if copied_code_path is not None:
+        payload["copied_code_file"] = str(copied_code_path.resolve())
+    if full_test.get("error"):
+        safe_print(f"Standalone full test failed: {full_test.get('error')}")
+    else:
+        for problem_size, metrics in full_test.get("problem_sizes", {}).items():
+            safe_print(
+                "  "
+                f"Problem size {problem_size}: "
+                f"teacher={metrics.get('teacher_score')}, "
+                f"student={metrics.get('student_score')}, "
+                f"gap={metrics.get('gap_percent')}%"
+            )
+        safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
+    if output_run_dir is not None:
+        save_final_test_result(output_run_dir, payload)
+        safe_print(f"Saved full test result to: {output_run_dir / 'final_test.json'}")
+    return payload
 
 
 if __name__ == "__main__":
@@ -380,55 +561,122 @@ if __name__ == "__main__":
         action="store_true",
         help="不创建 output/<task>/<时间戳>/ 目录（默认每次运行都会记录终端与演化快照）",
     )
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        help="指定物理 GPU 编号，例如 `--gpu 1`；会自动映射为进程内的 `cuda:0`",
+    )
+    parser.add_argument(
+        "--full-test",
+        action="store_true",
+        help="演化结束后，对最终 archive 第一名运行完整测试，并写入 final_test.json",
+    )
+    parser.add_argument(
+        "--full-test-mode",
+        choices=["val", "test"],
+        default="test",
+        help="`--full-test` 使用的完整评测配置，默认 `test`",
+    )
+    parser.add_argument(
+        "--test-code",
+        default=None,
+        metavar="PATH",
+        help="跳过演化，直接对指定 `.py` 代码文件运行完整测试",
+    )
     args = parser.parse_args()
 
     import os
 
+    configure_gpu_environment(args.gpu)
+    standalone_test = args.test_code is not None
     if args.llm_preset:
         os.environ["LLM_PRESET"] = args.llm_preset
     if args.llm_config:
         os.environ["LLM_CONFIG_FILE"] = args.llm_config
-    configure_llm(
-        base_url=args.llm_base_url,
-        api_key=args.llm_api_key,
-        model=args.llm_model,
-        timeout=args.llm_timeout,
-        replace_all=True,
-    )
+    if not standalone_test:
+        configure_llm(
+            base_url=args.llm_base_url,
+            api_key=args.llm_api_key,
+            model=args.llm_model,
+            timeout=args.llm_timeout,
+            replace_all=True,
+        )
 
     eoa_root = Path(__file__).resolve().parent
     run_dir: Optional[Path] = None
     task = get_task(args.task)
-    if not args.no_run_output:
+    persist_run_output = (not args.no_run_output) or args.full_test or standalone_test
+    if args.no_run_output and (args.full_test or standalone_test):
+        print("[info] full test output requires persisted output; creating output directory anyway.", flush=True)
+    if persist_run_output:
         run_dir = make_run_output_dir(eoa_root, args.task)
-        s = get_llm_settings()
-        key = s.api_key
-        if not key:
-            masked = "(empty)"
-        elif len(key) <= 8:
-            masked = "***"
+        if standalone_test:
+            llm_meta = {"skipped": True, "reason": "standalone_full_test"}
         else:
-            masked = key[:4] + "…" + key[-2:]
+            s = get_llm_settings()
+            key = s.api_key
+            if not key:
+                masked = "(empty)"
+            elif len(key) <= 8:
+                masked = "***"
+            else:
+                masked = key[:4] + "…" + key[-2:]
+            llm_meta = {
+                "base_url": s.base_url,
+                "model": s.model,
+                "timeout": s.timeout,
+                "api_key_preview": masked,
+            }
         write_run_meta(
             run_dir,
             task_id=args.task,
             target_function_name=task.target_function_name,
             argv=sys.argv,
-            llm_meta={
-                "base_url": s.base_url,
-                "model": s.model,
-                "timeout": s.timeout,
-                "api_key_preview": masked,
+            llm_meta=llm_meta,
+            runtime_meta={
+                "gpu_requested": gpu_requested(),
+                "visible_gpu": visible_gpu() or None,
             },
         )
 
     start = time.time()
     if run_dir is not None:
         with tee_terminal_to_file(run_dir):
-            main(task, output_run_dir=run_dir, llm_concurrency=args.llm_concurrency)
+            if standalone_test:
+                run_full_test_for_code_path(
+                    task,
+                    Path(args.test_code),
+                    mode=args.full_test_mode,
+                    output_run_dir=run_dir,
+                )
+            else:
+                archive = main(task, output_run_dir=run_dir, llm_concurrency=args.llm_concurrency)
+                if args.full_test:
+                    run_full_test_for_archive(
+                        task,
+                        archive,
+                        mode=args.full_test_mode,
+                        output_run_dir=run_dir,
+                    )
             end = time.time()
             safe_print(f"\nTotal runtime: {end - start:.2f} seconds")
     else:
-        main(task, output_run_dir=None, llm_concurrency=args.llm_concurrency)
+        if standalone_test:
+            run_full_test_for_code_path(
+                task,
+                Path(args.test_code),
+                mode=args.full_test_mode,
+                output_run_dir=None,
+            )
+        else:
+            archive = main(task, output_run_dir=None, llm_concurrency=args.llm_concurrency)
+            if args.full_test:
+                run_full_test_for_archive(
+                    task,
+                    archive,
+                    mode=args.full_test_mode,
+                    output_run_dir=None,
+                )
         end = time.time()
         safe_print(f"\nTotal runtime: {end - start:.2f} seconds")

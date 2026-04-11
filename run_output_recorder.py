@@ -96,6 +96,7 @@ def write_run_meta(
     target_function_name: str,
     argv: List[str],
     llm_meta: Dict[str, Any],
+    runtime_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload = {
         "task_id": task_id,
@@ -105,17 +106,68 @@ def write_run_meta(
         "argv": argv,
         "llm": llm_meta,
     }
+    if runtime_meta:
+        payload["runtime"] = runtime_meta
     (run_dir / "run_meta.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def _ordered_fitness(fitness: Any) -> Any:
+    if not isinstance(fitness, dict):
+        return fitness
+    ordered: Dict[str, Any] = {}
+    for key in ("combined_score", "eval_time", "error"):
+        if key in fitness:
+            ordered[key] = fitness[key]
+    for key, value in fitness.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
 
 
 def _jsonable_individual(ind: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "thought": ind.get("thought", ""),
         "code": ind.get("code", ""),
-        "fitness": ind.get("fitness", {}),
+        "fitness": _ordered_fitness(ind.get("fitness", {})),
     }
+
+
+def _log_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+
+
+def log_code_run_start(iteration: int, code_index: int, *, phase: str = "eval") -> None:
+    print(
+        f"[{_log_timestamp()}][root][INFO] - "
+        f"Iteration {iteration}: Running Code {code_index} ({phase})",
+        flush=True,
+    )
+
+
+def log_code_run_finish(
+    iteration: int,
+    code_index: int,
+    *,
+    success: bool,
+    elapsed: float | None = None,
+    fitness: Optional[Dict[str, Any]] = None,
+    error: str | None = None,
+    phase: str = "eval",
+) -> None:
+    status = "successful" if success else "failed"
+    details: List[str] = [f"Iteration {iteration}: Code Run {code_index} {status}!"]
+    if elapsed is not None:
+        details.append(f"elapsed={elapsed:.3f}s")
+    if fitness:
+        if "combined_score" in fitness:
+            details.append(f"combined_score={fitness.get('combined_score')}")
+        if fitness.get("error"):
+            details.append(f"error={fitness.get('error')}")
+    elif error:
+        details.append(f"error={error}")
+    print(f"[{_log_timestamp()}][root][INFO] - " + " ".join(details) + f" ({phase})", flush=True)
 
 
 def save_generation_snapshot(
@@ -145,3 +197,14 @@ def save_final_archive(run_dir: Path, archive: List[Dict[str, Any]]) -> None:
         json.dumps([_jsonable_individual(x) for x in archive], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def save_final_test_result(run_dir: Path, result: Dict[str, Any]) -> None:
+    path = run_dir / "final_test.json"
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_code_artifact(run_dir: Path, *, filename: str, code: str) -> Path:
+    path = run_dir / filename
+    path.write_text(code, encoding="utf-8")
+    return path

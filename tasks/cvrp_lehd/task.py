@@ -36,6 +36,9 @@ class CvrpLehdTask(EvolutionTask):
     def evaluate_raw(self, code: str) -> Dict[str, Any]:
         return evaluation.run_evaluation(code)
 
+    def run_full_test(self, code: str, *, mode: str = "test") -> Dict[str, Any]:
+        return evaluation.run_full_test(code, mode=mode)
+
     @property
     def prompt_strategies(self) -> PromptStrategies:
         return prompts.PROMPT_STRATEGIES
@@ -61,8 +64,8 @@ class CvrpLehdTask(EvolutionTask):
                 "\n```\n\nInstruction: ",
                 diversity_instruction,
                 "\n\nRespond with Strategic Thought and one ```python``` block with complete runnable code "
-                f"(imports allowed), defining the evolved function like `{self.target_function_name}` "
-                "or a versioned variant consistent with the seed.",
+                f"(imports allowed), defining the evolved function exactly as `{self.target_function_name}`. "
+                "Do not invent new names or new version suffixes.",
             ]
         )
 

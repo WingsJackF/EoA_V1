@@ -159,7 +159,7 @@ class VRPEnv:
         visit_depot_num_numpy = visit_depot_num.clone().cpu().numpy()
 
         temp_index = np.dot(visit_depot_num_numpy, temp_tri)
-        temp_index_torch = torch.from_numpy(temp_index).long().cuda()
+        temp_index_torch = torch.from_numpy(temp_index).long().to(solution.device)
 
         pick_end_with_depot_index = temp_index_torch + first_node_index
         pick_end_with_depot_ = end_with_depot[pick_end_with_depot_index][:,1]
@@ -214,7 +214,7 @@ class VRPEnv:
         visit_depot_num_numpy = visit_depot_num.clone().cpu().numpy()
 
         temp_index = np.dot(visit_depot_num_numpy, temp_tri)
-        temp_index_torch = torch.from_numpy(temp_index).long().cuda()
+        temp_index_torch = torch.from_numpy(temp_index).long().to(problems.device)
         select_end_with_depot_node_index_ = select_end_with_depot_node_index + temp_index_torch
 
         # This is the point at which each instance is randomly selected with an end with depot
@@ -258,7 +258,7 @@ class VRPEnv:
         visit_depot_num_numpy_2 = visit_depot_num_2.clone().cpu().numpy()
 
         temp_index_2 = np.dot(visit_depot_num_numpy_2, temp_tri_2)
-        temp_index_torch_2 = torch.from_numpy(temp_index_2).long().cuda()
+        temp_index_torch_2 = torch.from_numpy(temp_index_2).long().to(problems.device)
 
         select_end_with_depot_node_index_2 = select_end_with_depot_node_index_2 + temp_index_torch_2
         before_is_via_depot_index = before_is_via_depot[select_end_with_depot_node_index_2]
