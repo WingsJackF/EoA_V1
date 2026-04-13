@@ -67,3 +67,25 @@ def run_evaluation(program_code: str) -> Dict[str, Any]:
                     sys.path.remove(temp_dir)
                 except ValueError:
                     pass
+
+
+def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
+    result = run_evaluation(program_code)
+    if result.get("error"):
+        return {
+            "mode": mode,
+            "problem_sizes": {},
+            "mean_combined_score": None,
+            "error": result.get("error"),
+        }
+    metrics = {
+        "combined_score": result.get("combined_score"),
+        "min_max_ratio": result.get("min_max_ratio"),
+        "eval_time": result.get("eval_time"),
+    }
+    return {
+        "mode": mode,
+        "problem_sizes": {"16": metrics},
+        "mean_combined_score": float(result.get("combined_score", 0.0)),
+        "error": None,
+    }

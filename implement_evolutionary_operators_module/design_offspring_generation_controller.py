@@ -245,14 +245,152 @@ Constraints:
     - Does not swallow broad exceptions; handles specific exception types.
 """
 
-from typing import TYPE_CHECKING, Any, Dict, List
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import time
 
 from run_output_recorder import log_code_run_finish, log_code_run_start
 from tasks.base import FAILED_COMBINED_SCORE
+from tasks.task_support.eval_timeout import eval_timeout_is_disabled, run_spawn_eval_jobs, spawn_offspring_eval_worker
+from tasks.task_support.processes import cleanup_process_pool
 
 if TYPE_CHECKING:
     from tasks.base import EvolutionTask
+
+
+def _offspring_failure_fitness() -> Dict[str, Any]:
+    return {
+        "combined_score": FAILED_COMBINED_SCORE,
+        "eval_time": 0.0,
+        "error": None,
+    }
+
+
+def _evaluate_single_offspring(task_id: str, raw_content: Any, logical_cuda_device: int | None = None) -> Dict[str, Any]:
+    from tasks.task_support.gpu import configure_logical_cuda_device
+    from tasks import get_task
+
+    configure_logical_cuda_device(logical_cuda_device)
+    task = get_task(task_id)
+    failure_fitness = _offspring_failure_fitness()
+
+    if not isinstance(raw_content, str):
+        return {
+            "individual": {
+                "thought": "",
+                "code": "",
+                "fitness": {**failure_fitness, "error": "Raw offspring content is not a string"},
+            },
+            "elapsed": 0.0,
+        }
+
+    eval_start = time.perf_counter()
+
+    try:
+        sections = task.extract_thought_and_code(raw_content)
+        thought = sections.get("thought", "").strip()
+        code = sections.get("code", "").strip()
+    except ValueError as ve:
+        elapsed = time.perf_counter() - eval_start
+        return {
+            "individual": {
+                "thought": "",
+                "code": "",
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": f"Extraction failed: {str(ve)}"},
+            },
+            "elapsed": elapsed,
+        }
+    except TypeError as te:
+        elapsed = time.perf_counter() - eval_start
+        return {
+            "individual": {
+                "thought": "",
+                "code": "",
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": f"Extraction TypeError: {str(te)}"},
+            },
+            "elapsed": elapsed,
+        }
+
+    try:
+        task.validate_syntax(code)
+    except SyntaxError as se:
+        elapsed = time.perf_counter() - eval_start
+        return {
+            "individual": {
+                "thought": thought,
+                "code": code,
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": f"SyntaxError: {str(se)}"},
+            },
+            "elapsed": elapsed,
+        }
+    except ValueError as ve:
+        elapsed = time.perf_counter() - eval_start
+        return {
+            "individual": {
+                "thought": thought,
+                "code": code,
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": f"Validation Error: {str(ve)}"},
+            },
+            "elapsed": elapsed,
+        }
+    except TypeError as te:
+        elapsed = time.perf_counter() - eval_start
+        return {
+            "individual": {
+                "thought": thought,
+                "code": code,
+                "fitness": {**failure_fitness, "eval_time": elapsed, "error": f"Validation TypeError: {str(te)}"},
+            },
+            "elapsed": elapsed,
+        }
+
+    try:
+        fitness = task.evaluate(code)
+        elapsed = time.perf_counter() - eval_start
+        if not isinstance(fitness, dict):
+            fitness = {
+                **failure_fitness,
+                "eval_time": elapsed,
+                "error": "Evaluator returned non-dict result",
+            }
+        else:
+            if "error" not in fitness:
+                fitness["error"] = None
+            try:
+                if float(fitness.get("eval_time", 0.0)) <= 0.0:
+                    fitness["eval_time"] = elapsed
+            except (TypeError, ValueError):
+                fitness["eval_time"] = elapsed
+    except ImportError as ie:
+        elapsed = time.perf_counter() - eval_start
+        fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator import error: {str(ie)}"}
+    except TypeError as te:
+        elapsed = time.perf_counter() - eval_start
+        fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator TypeError: {str(te)}"}
+
+    return {
+        "individual": {
+            "thought": thought,
+            "code": code,
+            "fitness": fitness,
+        },
+        "elapsed": elapsed,
+    }
+
+
+def _log_offspring_result(iteration: int, code_index: int, result: Dict[str, Any]) -> None:
+    individual = result["individual"]
+    fitness = individual.get("fitness", {})
+    log_code_run_finish(
+        iteration,
+        code_index,
+        success=not bool(fitness.get("error")),
+        elapsed=float(result.get("elapsed", 0.0)),
+        fitness=fitness if isinstance(fitness, dict) else None,
+        error=None if isinstance(fitness, dict) else "Worker returned invalid fitness payload",
+        phase="offspring",
+    )
 
 
 def collect_and_integrate_offspring_results(
@@ -261,6 +399,9 @@ def collect_and_integrate_offspring_results(
     *,
     iteration: int = 0,
     code_index_start: int = 0,
+    evaluation_concurrency: int = 1,
+    evaluation_gpu_logical_ids: Optional[List[int]] = None,
+    evaluation_timeout_seconds: float | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Processes LLM-generated offspring, evaluates, and formats them.
@@ -272,7 +413,7 @@ def collect_and_integrate_offspring_results(
     Returns:
         List of evaluated individuals, each as a dict with 'thought', 'code', and 'fitness'.
         If extraction/validation/evaluation fails for an item, its 'fitness' will contain an 'error' entry
-        describing the failure and combined_score set to 0.0.
+        describing the failure and combined_score set to FAILED_COMBINED_SCORE.
     """
     from tasks.base import EvolutionTask as _ET
 
@@ -280,193 +421,77 @@ def collect_and_integrate_offspring_results(
         raise TypeError("task must be an EvolutionTask instance")
     if not isinstance(raw_offspring_contents, list):
         raise TypeError("raw_offspring_contents must be a list of strings")
+    if not isinstance(evaluation_concurrency, int) or evaluation_concurrency <= 0:
+        raise ValueError("evaluation_concurrency must be a positive integer")
+    if evaluation_gpu_logical_ids is not None and not isinstance(evaluation_gpu_logical_ids, list):
+        raise TypeError("evaluation_gpu_logical_ids must be a list of ints or None")
 
-    evaluated_individuals: List[Dict[str, Any]] = []
+    if not raw_offspring_contents:
+        return []
 
-    for idx, raw_content in enumerate(raw_offspring_contents):
-        code_index = code_index_start + idx
-        # Prepare a default failure fitness template
-        failure_fitness = {
-            "combined_score": FAILED_COMBINED_SCORE,
-            "eval_time": 0.0,
-            "error": None
-        }
-
-        if not isinstance(raw_content, str):
+    if not eval_timeout_is_disabled(evaluation_timeout_seconds):
+        limit = float(evaluation_timeout_seconds)
+        max_workers = min(evaluation_concurrency, len(raw_offspring_contents))
+        jobs: List[Tuple[int, Tuple[Any, ...]]] = []
+        for idx, raw_content in enumerate(raw_offspring_contents):
+            code_index = code_index_start + idx
             log_code_run_start(iteration, code_index, phase="offspring")
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=0.0,
-                error="Raw offspring content is not a string",
-                phase="offspring",
-            )
-            individual = {
-                "thought": "",
-                "code": "",
-                "fitness": {**failure_fitness, "error": "Raw offspring content is not a string"}
-            }
-            evaluated_individuals.append(individual)
-            continue
+            logical_cuda_device = None
+            if evaluation_gpu_logical_ids:
+                logical_cuda_device = evaluation_gpu_logical_ids[idx % len(evaluation_gpu_logical_ids)]
+            jobs.append((idx, (task.id, raw_content, logical_cuda_device)))
 
-        eval_start = time.perf_counter()
-        log_code_run_start(iteration, code_index, phase="offspring")
+        def _on_offspring_done(idx: int, result: Dict[str, Any]) -> None:
+            _log_offspring_result(iteration, code_index_start + idx, result)
 
-        # 1) Extract thought and code
-        try:
-            sections = task.extract_thought_and_code(raw_content)
-            thought = sections.get("thought", "").strip()
-            code = sections.get("code", "").strip()
-        except ValueError as ve:
-            elapsed = time.perf_counter() - eval_start
-            error = f"Extraction failed: {str(ve)}"
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=elapsed,
-                error=error,
-                phase="offspring",
-            )
-            individual = {
-                "thought": "",
-                "code": "",
-                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
-            }
-            evaluated_individuals.append(individual)
-            continue
-        except TypeError as te:
-            elapsed = time.perf_counter() - eval_start
-            error = f"Extraction TypeError: {str(te)}"
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=elapsed,
-                error=error,
-                phase="offspring",
-            )
-            individual = {
-                "thought": "",
-                "code": "",
-                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
-            }
-            evaluated_individuals.append(individual)
-            continue
+        results_map = run_spawn_eval_jobs(
+            jobs,
+            max_workers=max_workers,
+            job_timeout_seconds=limit,
+            worker_target=spawn_offspring_eval_worker,
+            on_job_complete=_on_offspring_done,
+        )
+        return [results_map[idx]["individual"] for idx in range(len(raw_offspring_contents))]
 
-        # 2) Validate code syntax and required function presence
-        try:
-            task.validate_syntax(code)
-        except SyntaxError as se:
-            elapsed = time.perf_counter() - eval_start
-            error = f"SyntaxError: {str(se)}"
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=elapsed,
-                error=error,
-                phase="offspring",
-            )
-            individual = {
-                "thought": thought,
-                "code": code,
-                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
-            }
-            evaluated_individuals.append(individual)
-            continue
-        except ValueError as ve:
-            elapsed = time.perf_counter() - eval_start
-            error = f"Validation Error: {str(ve)}"
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=elapsed,
-                error=error,
-                phase="offspring",
-            )
-            individual = {
-                "thought": thought,
-                "code": code,
-                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
-            }
-            evaluated_individuals.append(individual)
-            continue
-        except TypeError as te:
-            elapsed = time.perf_counter() - eval_start
-            error = f"Validation TypeError: {str(te)}"
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=elapsed,
-                error=error,
-                phase="offspring",
-            )
-            individual = {
-                "thought": thought,
-                "code": code,
-                "fitness": {**failure_fitness, "eval_time": elapsed, "error": error}
-            }
-            evaluated_individuals.append(individual)
-            continue
+    if evaluation_concurrency == 1 or len(raw_offspring_contents) == 1:
+        evaluated_individuals: List[Dict[str, Any]] = []
+        for idx, raw_content in enumerate(raw_offspring_contents):
+            code_index = code_index_start + idx
+            log_code_run_start(iteration, code_index, phase="offspring")
+            logical_cuda_device = None
+            if evaluation_gpu_logical_ids:
+                logical_cuda_device = evaluation_gpu_logical_ids[idx % len(evaluation_gpu_logical_ids)]
+            result = _evaluate_single_offspring(task.id, raw_content, logical_cuda_device)
+            _log_offspring_result(iteration, code_index, result)
+            evaluated_individuals.append(result["individual"])
+        return evaluated_individuals
 
-        # 3) Evaluate the code using task-bound evaluator
-        try:
-            fitness = task.evaluate(code)
-            elapsed = time.perf_counter() - eval_start
-            if not isinstance(fitness, dict):
-                fitness = {**failure_fitness, "eval_time": elapsed, "error": "Evaluator returned non-dict result"}
-            else:
-                if "error" not in fitness:
-                    fitness["error"] = None
-                try:
-                    if float(fitness.get("eval_time", 0.0)) <= 0.0:
-                        fitness["eval_time"] = elapsed
-                except (TypeError, ValueError):
-                    fitness["eval_time"] = elapsed
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=not bool(fitness.get("error")),
-                elapsed=elapsed,
-                fitness=fitness,
-                phase="offspring",
-            )
-        except ImportError as ie:
-            elapsed = time.perf_counter() - eval_start
-            fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator import error: {str(ie)}"}
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=elapsed,
-                fitness=fitness,
-                phase="offspring",
-            )
-        except TypeError as te:
-            elapsed = time.perf_counter() - eval_start
-            fitness = {**failure_fitness, "eval_time": elapsed, "error": f"Evaluator TypeError: {str(te)}"}
-            log_code_run_finish(
-                iteration,
-                code_index,
-                success=False,
-                elapsed=elapsed,
-                fitness=fitness,
-                phase="offspring",
-            )
-        # Note: Do not catch arbitrary Exception per module constraints.
+    results_by_index: Dict[int, Dict[str, Any]] = {}
+    max_workers = min(evaluation_concurrency, len(raw_offspring_contents))
+    spawn_context = mp.get_context("spawn")
+    executor: ProcessPoolExecutor | None = None
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_context) as executor:
+            future_to_index = {}
+            for idx, raw_content in enumerate(raw_offspring_contents):
+                code_index = code_index_start + idx
+                log_code_run_start(iteration, code_index, phase="offspring")
+                logical_cuda_device = None
+                if evaluation_gpu_logical_ids:
+                    logical_cuda_device = evaluation_gpu_logical_ids[idx % len(evaluation_gpu_logical_ids)]
+                future = executor.submit(_evaluate_single_offspring, task.id, raw_content, logical_cuda_device)
+                future_to_index[future] = idx
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                code_index = code_index_start + idx
+                result = future.result()
+                _log_offspring_result(iteration, code_index, result)
+                results_by_index[idx] = result["individual"]
+    except KeyboardInterrupt:
+        cleanup_process_pool(executor)
+        raise
 
-        individual = {
-            "thought": thought,
-            "code": code,
-            "fitness": fitness
-        }
-        evaluated_individuals.append(individual)
-
-    return evaluated_individuals
+    return [results_by_index[idx] for idx in range(len(raw_offspring_contents))]
 
 
 

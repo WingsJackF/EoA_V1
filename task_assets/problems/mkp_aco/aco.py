@@ -16,33 +16,33 @@ class ACO():
                  beta=1,
                  device='cpu'
                  ):
+        self.device = torch.device(device)
         self.n, self.m = weight.shape
         
-        self.prize = prize
-        self.weight = weight
+        self.prize = torch.as_tensor(prize, device=self.device)
+        self.weight = torch.as_tensor(weight, device=self.device)
         
         self.n_ants = n_ants
         self.decay = decay
         self.alpha = alpha
         self.beta = beta
 
-        self.pheromone = torch.ones(size=(self.n+1,), device=device)
+        self.pheromone = torch.ones(size=(self.n+1,), device=self.device, dtype=self.prize.dtype)
 
         # Fidanova S. Hybrid ant colony optimization algorithm for multiple knapsack problem
         # self.heuristic = prize / self.weight.sum(dim=1) if heuristic is None else heuristic
-        self.heuristic = heuristic
+        self.heuristic = torch.as_tensor(heuristic, device=self.device)
         # Leguizamon G, Michalewicz Z. A New Version of Ant System for Subset Problems
         self.Q = 1 / self.prize.sum()
 
         self.alltime_best_sol = None
         self.alltime_best_obj = 0
-        self.device = device
         self.add_dummy_node()
         
     def add_dummy_node(self):
-        self.prize = torch.cat((self.prize, torch.tensor([0.], device=self.device))) # (n+1,)
-        self.weight = torch.cat((self.weight, torch.zeros((1, self.m), device=self.device)), dim=0) # (n+1, m)
-        self.heuristic = torch.cat((self.heuristic, torch.tensor([1e-8], device=self.device))) # (n+1)
+        self.prize = torch.cat((self.prize, torch.tensor([0.], device=self.device, dtype=self.prize.dtype))) # (n+1,)
+        self.weight = torch.cat((self.weight, torch.zeros((1, self.m), device=self.device, dtype=self.weight.dtype)), dim=0) # (n+1, m)
+        self.heuristic = torch.cat((self.heuristic, torch.tensor([1e-8], device=self.device, dtype=self.heuristic.dtype))) # (n+1)
 
     @torch.no_grad()
     def run(self, n_iterations):
@@ -121,7 +121,7 @@ class ACO():
             new_item: (n_ants)
         '''
         if new_item is not None:
-            mask[torch.arange(self.n_ants), new_item] = 0
+            mask[torch.arange(self.n_ants, device=self.device), new_item] = 0
             knapsack += self.weight[new_item] # (n_ants, m)
         for ant_idx in range(self.n_ants):
             candidates = torch.nonzero(mask[ant_idx]) # (x, 1)

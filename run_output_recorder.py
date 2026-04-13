@@ -204,6 +204,11 @@ def save_final_test_result(run_dir: Path, result: Dict[str, Any]) -> None:
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def save_named_result(run_dir: Path, *, filename: str, result: Dict[str, Any]) -> None:
+    path = run_dir / filename
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def save_code_artifact(run_dir: Path, *, filename: str, code: str) -> Path:
     path = run_dir / filename
     path.write_text(code, encoding="utf-8")

@@ -16,8 +16,9 @@ class ACO():
                  ):
         
         self.n = len(prizes)
-        self.distances = distances
-        self.prizes = prizes
+        self.device = torch.device(device)
+        self.distances = torch.as_tensor(distances, device=self.device)
+        self.prizes = torch.as_tensor(prizes, device=self.device)
         self.max_len = max_len
         
         self.n_ants = n_ants
@@ -26,14 +27,15 @@ class ACO():
         self.beta = beta
         
         self.pheromone = torch.ones_like(self.distances)
-        self.heuristic = heuristic
+        if heuristic is None:
+            self.heuristic = torch.ones_like(self.distances)
+        else:
+            self.heuristic = torch.as_tensor(heuristic, device=self.device)
         
-        self.Q = 1 / prizes.sum()
+        self.Q = 1 / self.prizes.sum()
         
         self.alltime_best_sol = None
         self.alltime_best_obj = 0
-
-        self.device = device
         
         self.add_dummy_node()
         
@@ -49,12 +51,17 @@ class ACO():
         heuristic: [>0]
         prizes: [x,x,...,0]
         '''
-        self.prizes = torch.cat((self.prizes, torch.tensor([1e-10], device=self.device)))
-        distances = torch.cat((self.distances, 1e10 * torch.ones(size=(1, self.n), device=self.device)), dim=0)
-        self.distances = torch.cat((distances, 1e-10 + torch.zeros(size=(self.n+1, 1), device=self.device)), dim=1)
+        prize_pad = torch.tensor([1e-10], device=self.device, dtype=self.prizes.dtype)
+        self.prizes = torch.cat((self.prizes, prize_pad))
+        distance_pad_row = 1e10 * torch.ones(size=(1, self.n), device=self.device, dtype=self.distances.dtype)
+        distances = torch.cat((self.distances, distance_pad_row), dim=0)
+        distance_pad_col = 1e-10 + torch.zeros(size=(self.n+1, 1), device=self.device, dtype=self.distances.dtype)
+        self.distances = torch.cat((distances, distance_pad_col), dim=1)
 
-        self.heuristic = torch.cat((self.heuristic, torch.zeros(size=(1, self.n), device=self.device)), dim=0) # cannot reach other nodes from dummy node
-        self.heuristic = torch.cat((self.heuristic, torch.ones(size=(self.n+1, 1), device=self.device)), dim=1)
+        heuristic_pad_row = torch.zeros(size=(1, self.n), device=self.device, dtype=self.heuristic.dtype)
+        self.heuristic = torch.cat((self.heuristic, heuristic_pad_row), dim=0) # cannot reach other nodes from dummy node
+        heuristic_pad_col = torch.ones(size=(self.n+1, 1), device=self.device, dtype=self.heuristic.dtype)
+        self.heuristic = torch.cat((self.heuristic, heuristic_pad_col), dim=1)
 
         self.pheromone = torch.ones_like(self.distances)
         self.distances[self.distances == 1e-10] = 0

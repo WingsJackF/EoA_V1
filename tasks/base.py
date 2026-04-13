@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import importlib
 from typing import Any, Callable, Dict, List, Tuple
 
 from tasks.task_support.text_utils import ensure_target_function_name
@@ -82,7 +83,34 @@ class EvolutionTask(ABC):
         return normalize_standard_fitness(self.evaluate_raw(code))
 
     def run_full_test(self, code: str, *, mode: str = "test") -> Dict[str, Any]:
+        module_name = self.__class__.__module__
+        parts = module_name.rsplit(".", 1)
+        if len(parts) != 2:
+            raise NotImplementedError(f"Task `{self.id}` does not support full test mode.")
+        eval_module_name = f"{parts[0]}.evaluation"
+        try:
+            eval_module = importlib.import_module(eval_module_name)
+        except ImportError as e:
+            raise NotImplementedError(f"Task `{self.id}` does not support full test mode.") from e
+        run_full_test = getattr(eval_module, "run_full_test", None)
+        if callable(run_full_test):
+            return run_full_test(code, mode=mode)
         raise NotImplementedError(f"Task `{self.id}` does not support full test mode.")
+
+    def run_additional_test(self, code: str, *, label: str = "default") -> Dict[str, Any]:
+        module_name = self.__class__.__module__
+        parts = module_name.rsplit(".", 1)
+        if len(parts) != 2:
+            raise NotImplementedError(f"Task `{self.id}` does not support additional tests.")
+        eval_module_name = f"{parts[0]}.evaluation"
+        try:
+            eval_module = importlib.import_module(eval_module_name)
+        except ImportError as e:
+            raise NotImplementedError(f"Task `{self.id}` does not support additional tests.") from e
+        run_additional_test = getattr(eval_module, "run_additional_test", None)
+        if callable(run_additional_test):
+            return run_additional_test(code, label=label)
+        raise NotImplementedError(f"Task `{self.id}` does not support additional tests.")
 
     def validate_syntax(self, code: str) -> None:
         from implement_llm_interaction_module.implement_response_parser import validate_constructor_syntax

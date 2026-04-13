@@ -7,25 +7,33 @@ if current_dir not in sys.path:
 sys.path.append(project_root)
 
 
-def _extract_gpu_arg(argv: list[str]) -> int | None:
+def _extract_gpu_args(argv: list[str]) -> list[int] | None:
     for idx, arg in enumerate(argv):
-        if arg != "--gpu":
-            continue
-        if idx + 1 >= len(argv):
-            return None
-        try:
-            return int(argv[idx + 1])
-        except ValueError:
-            return None
+        if arg == "--gpu":
+            if idx + 1 >= len(argv):
+                return None
+            try:
+                return [int(argv[idx + 1])]
+            except ValueError:
+                return None
+        if arg == "--gpus":
+            if idx + 1 >= len(argv):
+                return None
+            raw = argv[idx + 1]
+            try:
+                return [int(part.strip()) for part in raw.split(",") if part.strip()]
+            except ValueError:
+                return None
     return None
 
 
-_early_gpu_arg = _extract_gpu_arg(sys.argv[1:])
-if _early_gpu_arg is not None:
+_early_gpu_args = _extract_gpu_args(sys.argv[1:])
+if _early_gpu_args:
     os.environ["EOA_USE_CUDA"] = "1"
-    os.environ["EOA_VISIBLE_GPU"] = str(_early_gpu_arg)
+    _visible = ",".join(str(gpu_id) for gpu_id in _early_gpu_args)
+    os.environ["EOA_VISIBLE_GPU"] = _visible
     os.environ["EOA_CUDA_DEVICE_NUM"] = "0"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(_early_gpu_arg)
+    os.environ["CUDA_VISIBLE_DEVICES"] = _visible
 r"""
 Main executable for the task-pluggable evolutionary LLM+GP system.
 
@@ -69,11 +77,14 @@ from implement_llm_interaction_module.develop_api_wrapper import (
     safe_print,
 )
 from implement_llm_interaction_module.llm_config import configure_llm, get_llm_settings
-from tasks.task_support.gpu import configure_gpu_environment, gpu_requested, visible_gpu
+from tasks.task_support.gpu import configure_gpu_environment, gpu_requested, visible_gpu, visible_gpu_ids
+from tasks.task_support.eval_timeout import eval_timeout_is_disabled
+from tasks.task_support.processes import cleanup_process_pool
 from run_output_recorder import (
     make_run_output_dir,
     save_code_artifact,
     save_final_archive,
+    save_named_result,
     save_final_test_result,
     save_generation_snapshot,
     tee_terminal_to_file,
@@ -91,6 +102,9 @@ DEFAULT_STRATEGY_RATIOS = {
     "simplification": 0.2,
 }
 DEFAULT_LLM_CONCURRENCY = 8
+DEFAULT_LLM_POST_TIMEOUT = 180.0
+DEFAULT_EVAL_CONCURRENCY = 2
+DEFAULT_EVAL_TIMEOUT_SECONDS = 300.0
 # LLM：见 implement_llm_interaction_module/llm_config.py（环境变量 / --llm-* / LLM_CONFIG_FILE）
 # -------------------------------------------------------
 
@@ -112,7 +126,14 @@ def _log_llm_settings() -> None:
 
 def _log_runtime_settings() -> None:
     if gpu_requested():
-        safe_print(f"GPU selection: physical GPU {visible_gpu()} (mapped to cuda:0)")
+        gpu_ids = visible_gpu_ids()
+        if len(gpu_ids) <= 1:
+            safe_print(f"GPU selection: physical GPU {visible_gpu()} (mapped to cuda:0)")
+        else:
+            safe_print(
+                "GPU selection: physical GPUs "
+                f"{visible_gpu()} (workers map to logical cuda:{'/'.join(str(i) for i in range(len(gpu_ids)))})"
+            )
     else:
         safe_print("GPU selection: CPU/default device")
 
@@ -128,11 +149,42 @@ def _summarize_individual(ind: Dict[str, Any]) -> str:
     return f"combined_score={cs}, thought={thought}"
 
 
+def _format_full_test_metrics(metrics: Any) -> str:
+    if not isinstance(metrics, dict):
+        return str(metrics)
+    preferred_keys = (
+        "combined_score",
+        "objective",
+        "teacher_score",
+        "student_score",
+        "gap_percent",
+        "average_reward",
+        "avg_bins",
+        "l1_bound",
+        "excess_percent",
+        "min_max_ratio",
+    )
+    parts: List[str] = []
+    seen = set()
+    for key in preferred_keys:
+        if key in metrics:
+            parts.append(f"{key}={metrics.get(key)}")
+            seen.add(key)
+    for key, value in metrics.items():
+        if key in seen:
+            continue
+        parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
 def main(
     task: EvolutionTask,
     *,
     output_run_dir: Optional[Path] = None,
     llm_concurrency: int = DEFAULT_LLM_CONCURRENCY,
+    eval_concurrency: int = DEFAULT_EVAL_CONCURRENCY,
+    eval_gpu_logical_ids: Optional[List[int]] = None,
+    eval_timeout_seconds: Optional[float] = DEFAULT_EVAL_TIMEOUT_SECONDS,
 ) -> List[Dict[str, Any]]:
     """
     Main evolutionary loop orchestration.
@@ -143,9 +195,16 @@ def main(
     safe_print(f"Task: {task.id} (entry: {task.target_function_name})")
     _log_llm_settings()
     _log_runtime_settings()
+    if not eval_timeout_is_disabled(eval_timeout_seconds):
+        safe_print(f"Per-individual eval wall-clock timeout: {float(eval_timeout_seconds):g} s")
     if llm_concurrency <= 0:
         raise ValueError("llm_concurrency must be a positive integer")
-    safe_print(f"Initializing population with seed individual (llm_concurrency={llm_concurrency})...")
+    if eval_concurrency <= 0:
+        raise ValueError("eval_concurrency must be a positive integer")
+    safe_print(
+        "Initializing population with seed individual "
+        f"(llm_concurrency={llm_concurrency}, eval_concurrency={eval_concurrency})..."
+    )
     try:
         seed_ind = add_seed_individual(task)
     except (SyntaxError, ValueError, TypeError) as e:
@@ -164,6 +223,9 @@ def main(
                 task,
                 n_to_generate,
                 max_concurrency=llm_concurrency,
+                evaluation_concurrency=eval_concurrency,
+                evaluation_gpu_logical_ids=eval_gpu_logical_ids,
+                evaluation_timeout_seconds=eval_timeout_seconds,
             )
             # Only append properly formatted dicts
             skipped_generated = 0
@@ -277,7 +339,7 @@ def main(
             [payload for _, payload in prepared_offspring_requests],
             max_retries=5,
             base_backoff=2.0,
-            timeout=30.0,
+            timeout=DEFAULT_LLM_POST_TIMEOUT,
             verbose=True,
             max_concurrency=llm_concurrency,
         )
@@ -297,6 +359,10 @@ def main(
             offspring_raw_contents.append(raw_content)
 
         safe_print(f"Generated {len(offspring_raw_contents)} offspring (strategies: {strategies_used})")
+        safe_print(
+            f"Evaluating {len(offspring_raw_contents)} offspring with process pool "
+            f"(eval_concurrency={eval_concurrency})..."
+        )
 
         # Integrate offspring: parse, validate, evaluate
         try:
@@ -305,6 +371,9 @@ def main(
                 task,
                 iteration=gen,
                 code_index_start=0,
+                evaluation_concurrency=eval_concurrency,
+                evaluation_gpu_logical_ids=eval_gpu_logical_ids,
+                evaluation_timeout_seconds=eval_timeout_seconds,
             )
         except ImportError as ie:
             safe_print(f"Integration failed due to missing modules: {ie}")
@@ -468,17 +537,48 @@ def run_full_test_for_archive(
         safe_print(f"Full test failed: {full_test.get('error')}")
     else:
         for problem_size, metrics in full_test.get("problem_sizes", {}).items():
-            safe_print(
-                "  "
-                f"Problem size {problem_size}: "
-                f"teacher={metrics.get('teacher_score')}, "
-                f"student={metrics.get('student_score')}, "
-                f"gap={metrics.get('gap_percent')}%"
-            )
-        safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
+            safe_print(f"  Problem size {problem_size}: {_format_full_test_metrics(metrics)}")
+        if "mean_gap_percent" in full_test:
+            safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
+        elif "mean_combined_score" in full_test:
+            safe_print(f"Full test mean combined_score: {full_test.get('mean_combined_score')}")
     if output_run_dir is not None:
         save_final_test_result(output_run_dir, payload)
         safe_print(f"Saved full test result to: {output_run_dir / 'final_test.json'}")
+    return payload
+
+
+def run_additional_test_for_archive(
+    task: EvolutionTask,
+    archive: List[Dict[str, Any]],
+    *,
+    label: str,
+    output_run_dir: Optional[Path],
+) -> Optional[Dict[str, Any]]:
+    if not archive:
+        return None
+    top_archived = archive[0]
+    safe_print(f"\n=== Running additional `{label}` test for archived best individual ===")
+    code = top_archived.get("code", "")
+    try:
+        extra_test = task.run_additional_test(code, label=label)
+    except NotImplementedError:
+        return None
+    payload: Dict[str, Any] = {
+        "task_id": task.id,
+        "target_function_name": task.target_function_name,
+        "label": label,
+        "archive_fitness": top_archived.get("fitness", {}),
+        "additional_test": extra_test,
+    }
+    if extra_test.get("error"):
+        safe_print(f"Additional `{label}` test failed: {extra_test.get('error')}")
+    elif label == "tsplib":
+        safe_print(f"Additional `{label}` mean gap: {extra_test.get('mean_gap_percent')}%")
+    if output_run_dir is not None:
+        filename = f"additional_test_{label}.json"
+        save_named_result(output_run_dir, filename=filename, result=payload)
+        safe_print(f"Saved additional `{label}` result to: {output_run_dir / filename}")
     return payload
 
 
@@ -518,17 +618,47 @@ def run_full_test_for_code_path(
         safe_print(f"Standalone full test failed: {full_test.get('error')}")
     else:
         for problem_size, metrics in full_test.get("problem_sizes", {}).items():
-            safe_print(
-                "  "
-                f"Problem size {problem_size}: "
-                f"teacher={metrics.get('teacher_score')}, "
-                f"student={metrics.get('student_score')}, "
-                f"gap={metrics.get('gap_percent')}%"
-            )
-        safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
+            safe_print(f"  Problem size {problem_size}: {_format_full_test_metrics(metrics)}")
+        if "mean_gap_percent" in full_test:
+            safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
+        elif "mean_combined_score" in full_test:
+            safe_print(f"Full test mean combined_score: {full_test.get('mean_combined_score')}")
     if output_run_dir is not None:
         save_final_test_result(output_run_dir, payload)
         safe_print(f"Saved full test result to: {output_run_dir / 'final_test.json'}")
+    return payload
+
+
+def run_additional_test_for_code_path(
+    task: EvolutionTask,
+    code_path: Path,
+    *,
+    label: str,
+    output_run_dir: Optional[Path],
+) -> Optional[Dict[str, Any]]:
+    if not code_path.is_file():
+        raise FileNotFoundError(f"Code file not found: {code_path}")
+    code = code_path.read_text(encoding="utf-8")
+    safe_print(f"\n=== Running additional `{label}` test for code file: {code_path} ===")
+    try:
+        extra_test = task.run_additional_test(code, label=label)
+    except NotImplementedError:
+        return None
+    payload: Dict[str, Any] = {
+        "task_id": task.id,
+        "target_function_name": task.target_function_name,
+        "label": label,
+        "source_code_path": str(code_path.resolve()),
+        "additional_test": extra_test,
+    }
+    if extra_test.get("error"):
+        safe_print(f"Additional `{label}` test failed: {extra_test.get('error')}")
+    elif label == "tsplib":
+        safe_print(f"Additional `{label}` mean gap: {extra_test.get('mean_gap_percent')}%")
+    if output_run_dir is not None:
+        filename = f"additional_test_{label}.json"
+        save_named_result(output_run_dir, filename=filename, result=payload)
+        safe_print(f"Saved additional `{label}` result to: {output_run_dir / filename}")
     return payload
 
 
@@ -557,15 +687,35 @@ if __name__ == "__main__":
         help="LLM 并发请求数（初始化种群与每代 offspring 共用）",
     )
     parser.add_argument(
+        "--eval-concurrency",
+        type=int,
+        default=DEFAULT_EVAL_CONCURRENCY,
+        help="每代 offspring 代码评测的多进程并发数",
+    )
+    parser.add_argument(
+        "--eval-timeout",
+        type=float,
+        default=DEFAULT_EVAL_TIMEOUT_SECONDS,
+        metavar="SEC",
+        help="单个个体的代码评测墙钟超时（秒）；0 或负数关闭超时（恢复原先无限制行为）",
+    )
+    parser.add_argument(
         "--no-run-output",
         action="store_true",
         help="不创建 output/<task>/<时间戳>/ 目录（默认每次运行都会记录终端与演化快照）",
     )
-    parser.add_argument(
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument(
         "--gpu",
         type=int,
         default=None,
-        help="指定物理 GPU 编号，例如 `--gpu 1`；会自动映射为进程内的 `cuda:0`",
+        help="指定单个物理 GPU 编号，例如 `--gpu 1`；会映射为进程内的 `cuda:0`",
+    )
+    gpu_group.add_argument(
+        "--gpus",
+        default=None,
+        metavar="IDS",
+        help="指定多个物理 GPU 编号，例如 `--gpus 5,6`；评测 worker 会按逻辑设备轮转",
     )
     parser.add_argument(
         "--full-test",
@@ -588,7 +738,14 @@ if __name__ == "__main__":
 
     import os
 
-    configure_gpu_environment(args.gpu)
+    gpu_selection: int | list[int] | None
+    if args.gpus:
+        gpu_selection = [int(part.strip()) for part in args.gpus.split(",") if part.strip()]
+    else:
+        gpu_selection = args.gpu
+    configure_gpu_environment(gpu_selection)
+    eval_gpu_logical_ids = list(range(len(visible_gpu_ids()))) if gpu_requested() else None
+    eval_timeout_param: float | None = None if args.eval_timeout <= 0 else float(args.eval_timeout)
     standalone_test = args.test_code is not None
     if args.llm_preset:
         os.environ["LLM_PRESET"] = args.llm_preset
@@ -637,46 +794,90 @@ if __name__ == "__main__":
             runtime_meta={
                 "gpu_requested": gpu_requested(),
                 "visible_gpu": visible_gpu() or None,
+                "eval_timeout_seconds": eval_timeout_param,
             },
         )
 
     start = time.time()
-    if run_dir is not None:
-        with tee_terminal_to_file(run_dir):
+    try:
+        if run_dir is not None:
+            with tee_terminal_to_file(run_dir):
+                if standalone_test:
+                    run_full_test_for_code_path(
+                        task,
+                        Path(args.test_code),
+                        mode=args.full_test_mode,
+                        output_run_dir=run_dir,
+                    )
+                    run_additional_test_for_code_path(
+                        task,
+                        Path(args.test_code),
+                        label="tsplib",
+                        output_run_dir=run_dir,
+                    )
+                else:
+                    archive = main(
+                        task,
+                        output_run_dir=run_dir,
+                        llm_concurrency=args.llm_concurrency,
+                        eval_concurrency=args.eval_concurrency,
+                        eval_gpu_logical_ids=eval_gpu_logical_ids,
+                        eval_timeout_seconds=eval_timeout_param,
+                    )
+                    if args.full_test:
+                        run_full_test_for_archive(
+                            task,
+                            archive,
+                            mode=args.full_test_mode,
+                            output_run_dir=run_dir,
+                        )
+                    run_additional_test_for_archive(
+                        task,
+                        archive,
+                        label="tsplib",
+                        output_run_dir=run_dir,
+                    )
+                end = time.time()
+                safe_print(f"\nTotal runtime: {end - start:.2f} seconds")
+        else:
             if standalone_test:
                 run_full_test_for_code_path(
                     task,
                     Path(args.test_code),
                     mode=args.full_test_mode,
-                    output_run_dir=run_dir,
+                    output_run_dir=None,
+                )
+                run_additional_test_for_code_path(
+                    task,
+                    Path(args.test_code),
+                    label="tsplib",
+                    output_run_dir=None,
                 )
             else:
-                archive = main(task, output_run_dir=run_dir, llm_concurrency=args.llm_concurrency)
+                archive = main(
+                    task,
+                    output_run_dir=None,
+                    llm_concurrency=args.llm_concurrency,
+                    eval_concurrency=args.eval_concurrency,
+                    eval_gpu_logical_ids=eval_gpu_logical_ids,
+                    eval_timeout_seconds=eval_timeout_param,
+                )
                 if args.full_test:
                     run_full_test_for_archive(
                         task,
                         archive,
                         mode=args.full_test_mode,
-                        output_run_dir=run_dir,
+                        output_run_dir=None,
                     )
-            end = time.time()
-            safe_print(f"\nTotal runtime: {end - start:.2f} seconds")
-    else:
-        if standalone_test:
-            run_full_test_for_code_path(
-                task,
-                Path(args.test_code),
-                mode=args.full_test_mode,
-                output_run_dir=None,
-            )
-        else:
-            archive = main(task, output_run_dir=None, llm_concurrency=args.llm_concurrency)
-            if args.full_test:
-                run_full_test_for_archive(
+                run_additional_test_for_archive(
                     task,
                     archive,
-                    mode=args.full_test_mode,
+                    label="tsplib",
                     output_run_dir=None,
                 )
-        end = time.time()
-        safe_print(f"\nTotal runtime: {end - start:.2f} seconds")
+            end = time.time()
+            safe_print(f"\nTotal runtime: {end - start:.2f} seconds")
+    except KeyboardInterrupt:
+        cleanup_process_pool()
+        safe_print("\nInterrupted by user. Cleaned up worker processes.")
+        raise SystemExit(130)

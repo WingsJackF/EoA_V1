@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict
 import numpy as np
 
 from tasks.task_support.paths import problem_dir
-from tasks.task_support.runtime import load_program_module, resolve_callable
+from tasks.task_support.runtime import import_problem_module, load_program_module, resolve_callable
 
 POSSIBLE_NAMES = ("priority", "priority_v1", "priority_v2", "priority_v3")
 
@@ -57,6 +57,43 @@ def run_evaluation(program_code: str) -> Dict[str, Any]:
             raise FileNotFoundError(f"缺少数据集 {ds}，请在 task_assets/problems/bpp_online 下运行 gen_inst.generate_datasets()")
         with open(ds, "rb") as f:
             dataset = pickle.load(f)
-        return _evaluate_dataset(priority, dataset)
+        avg_bins = _evaluate_dataset(priority, dataset)
+        return -avg_bins
 
     return _wrap(inner)
+
+
+def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
+    try:
+        resolved_mode = "val" if mode == "test" else mode
+        if resolved_mode not in {"train", "val"}:
+            raise ValueError(f"Unsupported full test mode: {mode}")
+        module = load_program_module(program_code, module_name="bpp_online_full_candidate")
+        priority = resolve_callable(module, POSSIBLE_NAMES)
+        base = problem_dir("bpp_online")
+        ds = base / "dataset" / f"weibull_5k_{resolved_mode}.pickle"
+        if not ds.is_file():
+            gen_inst_mod = import_problem_module(base, "gen_inst")
+            gen_inst_mod.generate_datasets()
+        if not ds.is_file():
+            raise FileNotFoundError(f"缺少数据集 {ds}")
+        with open(ds, "rb") as f:
+            dataset = pickle.load(f)
+        avg_bins = _evaluate_dataset(priority, dataset)
+        l1_bound = float(dataset["l1_bound"])
+        excess_percent = float((avg_bins - l1_bound) / l1_bound * 100)
+        result = {
+            "avg_bins": float(avg_bins),
+            "l1_bound": l1_bound,
+            "excess_percent": excess_percent,
+            "combined_score": -excess_percent,
+        }
+        return {
+            "mode": mode,
+            "resolved_mode": resolved_mode,
+            "problem_sizes": {"5000": result},
+            "mean_combined_score": result["combined_score"],
+            "error": None,
+        }
+    except Exception as e:
+        return {"mode": mode, "problem_sizes": {}, "mean_combined_score": None, "error": str(e)}

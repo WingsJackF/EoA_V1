@@ -17,7 +17,7 @@ class TSPTester:
                  tester_params):
 
         # save arguments
-        self.env_params = env_params
+        self.env_params = dict(env_params)
         self.model_params = model_params
         self.tester_params = tester_params
 
@@ -37,10 +37,11 @@ class TSPTester:
             device = torch.device('cpu')
             torch.set_default_tensor_type('torch.FloatTensor')
         self.device = device
+        self.env_params['device'] = device
 
         # ENV and MODEL
         self.env = Env(**self.env_params)
-        self.model = Model(**self.model_params)
+        self.model = Model(**self.model_params).to(self.device)
 
         # Restore
         model_load = tester_params['model_load']

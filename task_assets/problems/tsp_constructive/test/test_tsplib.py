@@ -3,6 +3,14 @@ from scipy.spatial import distance_matrix
 from copy import copy
 from tqdm import tqdm
 
+try:
+    from gpt import select_next_node_v2 as select_next_node
+except Exception:
+    try:
+        from gpt import select_next_node
+    except Exception:
+        select_next_node = None
+
 # Datasets and baseline results are drawn from Duflo et al. (2019). A GP Hyper-Heuristic Approach for Generating TSP Heuristics.
 
 names = ["ts225", "rat99", "rl1889", "u1817", "d1655", "bier127", "lin318", "eil51", "d493", "kroB100", "kroC100", "ch130", "pr299", "fl417", "d657", "kroA150", "fl1577", "u724", "pr264", "pr226", "pr439"]
@@ -67,7 +75,11 @@ def select_next_node_candidate(current_node: int, destination_node: int, unvisit
     return next_node
 
 
-def eval_heuristic(node_positions: np.ndarray, start_node: int) -> float:
+def _resolve_selector():
+    return select_next_node if callable(select_next_node) else select_next_node_candidate
+
+
+def eval_heuristic(node_positions: np.ndarray, start_node: int, *, show_progress: bool = False) -> float:
     problem_size = node_positions.shape[0]
     # calculate distance matrix
     dist_mat = distance_matrix(node_positions, node_positions)
@@ -77,9 +89,10 @@ def eval_heuristic(node_positions: np.ndarray, start_node: int) -> float:
     unvisited = set(range(problem_size))
     # remove the starting node
     unvisited.remove(start_node)
+    selector = _resolve_selector()
     # run the heuristic
-    for _ in tqdm(range(problem_size - 1)):
-        next_node = select_next_node_candidate(
+    for _ in tqdm(range(problem_size - 1), disable=not show_progress):
+        next_node = selector(
             current_node=solution[-1],
             destination_node=start_node,
             unvisited_nodes=copy(unvisited),
@@ -98,28 +111,53 @@ def eval_heuristic(node_positions: np.ndarray, start_node: int) -> float:
     return obj
 
 
-if __name__ == '__main__':
+def _load_tsplib_instance(name: str) -> tuple[np.ndarray, float]:
+    with open(f'tsplib/{name}.tsp') as f:
+        lines = f.readlines()
+
+    data = lines[6:-1]
+    data = [x.strip().split() for x in data]
+    data = [[float(x) for x in row[1:]] for row in data]
+    data = np.array(data)
+    scale = max(np.max(data, axis=0) - np.min(data, axis=0))
+    data = (data - np.min(data, axis=0)) / scale
+    return data, scale
+
+
+def run_tsplib_test(*, show_progress: bool = False) -> dict:
+    results = {}
+    opt_gaps = []
+
     for name in names:
-        with open(f'tsplib/{name}.tsp') as f:
-            lines = f.readlines()
-
-        # Parse the data
-        data = lines[6:-1]
-        data = [x.strip().split() for x in data]
-        data = [[float(x) for x in row[1:]] for row in data]
-
-        # Scale the data to [0, 1]^2 to align with the training data
-        data = np.array(data)
-        scale = max(np.max(data, axis=0) - np.min(data, axis=0))
-        data = (data - np.min(data, axis=0)) / scale
-
-        # Evaluate the heuristic
+        data, scale = _load_tsplib_instance(name)
         objs = []
         for start_node in range(3):
-            obj = eval_heuristic(data, start_node) * scale
+            obj = eval_heuristic(data, start_node, show_progress=show_progress) * scale
             objs.append(obj)
-        mean, std = np.mean(objs), np.std(objs)
+        mean = float(np.mean(objs))
+        std = float(np.std(objs))
+        gap = float((mean - opt[name]) / opt[name] * 100)
+        results[name] = {
+            "objective_mean": mean,
+            "objective_std": std,
+            "optimal_value": float(opt[name]),
+            "gap_percent": gap,
+        }
+        opt_gaps.append(gap)
+
+    return {
+        "instances": results,
+        "mean_gap_percent": float(np.mean(opt_gaps)),
+        "error": None,
+    }
+
+
+if __name__ == '__main__':
+    payload = run_tsplib_test(show_progress=True)
+    for name in names:
+        stats = payload["instances"][name]
         print(name)
-        print(f"\tObjective: {mean}+-{std}")
-        print(f"\tOpt. Gap: {(mean - opt[name]) / opt[name] * 100}%")
+        print(f"\tObjective: {stats['objective_mean']}+-{stats['objective_std']}")
+        print(f"\tOpt. Gap: {stats['gap_percent']}%")
         print()
+    print(f"Mean Gap: {payload['mean_gap_percent']}%")

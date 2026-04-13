@@ -31,6 +31,7 @@ class TSPEnv:
         self.problem_size = env_params['problem_size']
         self.pomo_size = env_params['pomo_size']
         self.test_file_path = env_params['test_file_path']
+        self.device = env_params.get('device', torch.device('cpu'))
 
         # Const @Load_Problem
         ####################################
@@ -52,9 +53,9 @@ class TSPEnv:
     def load_problems(self, batch_size, aug_factor=1):
         self.batch_size = batch_size
         if self.test_file_path is not None:
-            self.problems = torch.load(self.test_file_path)
+            self.problems = torch.load(self.test_file_path, map_location=self.device)
         else:
-            self.problems = get_random_problems(batch_size, self.problem_size)
+            self.problems = get_random_problems(batch_size, self.problem_size).to(self.device)
         # problems.shape: (batch, problem, 2)
 
         if aug_factor > 1:
@@ -65,19 +66,19 @@ class TSPEnv:
             else:
                 raise NotImplementedError
 
-        self.BATCH_IDX = torch.arange(self.batch_size)[:, None].expand(self.batch_size, self.pomo_size)
-        self.POMO_IDX = torch.arange(self.pomo_size)[None, :].expand(self.batch_size, self.pomo_size)
+        self.BATCH_IDX = torch.arange(self.batch_size, device=self.device)[:, None].expand(self.batch_size, self.pomo_size)
+        self.POMO_IDX = torch.arange(self.pomo_size, device=self.device)[None, :].expand(self.batch_size, self.pomo_size)
 
     def reset(self):
         self.selected_count = 0
         self.current_node = None
         # shape: (batch, pomo)
-        self.selected_node_list = torch.zeros((self.batch_size, self.pomo_size, 0), dtype=torch.long)
+        self.selected_node_list = torch.zeros((self.batch_size, self.pomo_size, 0), dtype=torch.long, device=self.device)
         # shape: (batch, pomo, 0~problem)
 
         # CREATE STEP STATE
         self.step_state = Step_State(BATCH_IDX=self.BATCH_IDX, POMO_IDX=self.POMO_IDX)
-        self.step_state.ninf_mask = torch.zeros((self.batch_size, self.pomo_size, self.problem_size))
+        self.step_state.ninf_mask = torch.zeros((self.batch_size, self.pomo_size, self.problem_size), device=self.device)
         # shape: (batch, pomo, problem)
 
         reward = None
@@ -128,4 +129,3 @@ class TSPEnv:
         travel_distances = segment_lengths.sum(2)
         # shape: (batch, pomo)
         return travel_distances
-
