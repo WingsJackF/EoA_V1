@@ -66,7 +66,7 @@ class TSPTester:
             remaining = test_num_episode - episode
             batch_size = min(self.tester_params['test_batch_size'], remaining)
 
-            score, aug_score = self._test_one_batch(batch_size)
+            score, aug_score = self._test_one_batch(batch_size, start_index=episode)
 
             score_AM.update(score, batch_size)
             aug_score_AM.update(aug_score, batch_size)
@@ -89,7 +89,7 @@ class TSPTester:
         
         return aug_score_AM.avg
 
-    def _test_one_batch(self, batch_size):
+    def _test_one_batch(self, batch_size, start_index=0):
 
         # Augmentation
         ###############################################
@@ -102,7 +102,7 @@ class TSPTester:
         ###############################################
         self.model.eval()
         with torch.no_grad():
-            self.env.load_problems(batch_size, aug_factor)
+            self.env.load_problems(batch_size, aug_factor, start_index=start_index)
             reset_state, _, _ = self.env.reset()
             self.model.pre_forward(reset_state)
 

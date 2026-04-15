@@ -32,6 +32,7 @@ class TSPEnv:
         self.pomo_size = env_params['pomo_size']
         self.test_file_path = env_params['test_file_path']
         self.device = env_params.get('device', torch.device('cpu'))
+        self._loaded_dataset = None
 
         # Const @Load_Problem
         ####################################
@@ -50,10 +51,22 @@ class TSPEnv:
         self.selected_node_list = None
         # shape: (batch, pomo, 0~problem)
 
-    def load_problems(self, batch_size, aug_factor=1):
+    def _get_loaded_dataset(self):
+        if self._loaded_dataset is None:
+            self._loaded_dataset = torch.load(self.test_file_path, map_location=self.device)
+        return self._loaded_dataset
+
+    def load_problems(self, batch_size, aug_factor=1, start_index=0):
         self.batch_size = batch_size
         if self.test_file_path is not None:
-            self.problems = torch.load(self.test_file_path, map_location=self.device)
+            dataset = self._get_loaded_dataset()
+            end_index = start_index + batch_size
+            if start_index < 0 or end_index > dataset.size(0):
+                raise IndexError(
+                    f"Requested dataset slice [{start_index}:{end_index}] is out of range for "
+                    f"{self.test_file_path} with {dataset.size(0)} instances."
+                )
+            self.problems = dataset[start_index:end_index].clone()
         else:
             self.problems = get_random_problems(batch_size, self.problem_size).to(self.device)
         # problems.shape: (batch, problem, 2)
