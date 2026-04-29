@@ -10,7 +10,8 @@ build/
 dist/
 *.egg-info/
 .eggs/
-
+gen_task/
+output_deepseek/
 # Virtual environments
 .venv/
 venv/

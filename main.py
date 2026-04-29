@@ -692,6 +692,10 @@ if __name__ == "__main__":
         default=DEFAULT_EVAL_CONCURRENCY,
         help="每代 offspring 代码评测的多进程并发数",
     )
+    parser.add_argument("--generations", type=int, default=GENERATIONS, help="覆盖进化代数")
+    parser.add_argument("--population-size", type=int, default=POPULATION_SIZE, help="覆盖种群大小")
+    parser.add_argument("--offspring-per-gen", type=int, default=OFFSPRING_PER_GEN, help="覆盖每代后代数")
+    parser.add_argument("--elitism-count", type=int, default=ELITISM_COUNT, help="覆盖精英保留数")
     parser.add_argument(
         "--eval-timeout",
         type=float,
@@ -735,6 +739,11 @@ if __name__ == "__main__":
         help="跳过演化，直接对指定 `.py` 代码文件运行完整测试",
     )
     args = parser.parse_args()
+
+    POPULATION_SIZE = max(2, int(args.population_size))
+    GENERATIONS = max(1, int(args.generations))
+    OFFSPRING_PER_GEN = max(1, int(args.offspring_per_gen))
+    ELITISM_COUNT = max(1, min(int(args.elitism_count), POPULATION_SIZE))
 
     import os
 
