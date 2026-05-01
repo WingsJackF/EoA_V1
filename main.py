@@ -104,7 +104,7 @@ DEFAULT_STRATEGY_RATIOS = {
 DEFAULT_LLM_CONCURRENCY = 8
 DEFAULT_LLM_POST_TIMEOUT = 180.0
 DEFAULT_EVAL_CONCURRENCY = 2
-DEFAULT_EVAL_TIMEOUT_SECONDS = 300.0
+DEFAULT_EVAL_TIMEOUT_SECONDS = 30.0
 # LLM：见 implement_llm_interaction_module/llm_config.py（环境变量 / --llm-* / LLM_CONFIG_FILE）
 # -------------------------------------------------------
 
@@ -520,6 +520,7 @@ def run_full_test_for_archive(
             code=code,
         )
     try:
+        safe_print("[*] Running ...")
         full_test = task.run_full_test(code, mode=mode)
     except NotImplementedError as e:
         safe_print(str(e))
@@ -536,8 +537,6 @@ def run_full_test_for_archive(
     if full_test.get("error"):
         safe_print(f"Full test failed: {full_test.get('error')}")
     else:
-        for problem_size, metrics in full_test.get("problem_sizes", {}).items():
-            safe_print(f"  Problem size {problem_size}: {_format_full_test_metrics(metrics)}")
         if "mean_gap_percent" in full_test:
             safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
         elif "mean_combined_score" in full_test:
@@ -601,6 +600,7 @@ def run_full_test_for_code_path(
             code=code,
         )
     try:
+        safe_print("[*] Running ...")
         full_test = task.run_full_test(code, mode=mode)
     except NotImplementedError as e:
         safe_print(str(e))
@@ -617,8 +617,6 @@ def run_full_test_for_code_path(
     if full_test.get("error"):
         safe_print(f"Standalone full test failed: {full_test.get('error')}")
     else:
-        for problem_size, metrics in full_test.get("problem_sizes", {}).items():
-            safe_print(f"  Problem size {problem_size}: {_format_full_test_metrics(metrics)}")
         if "mean_gap_percent" in full_test:
             safe_print(f"Full test mean gap: {full_test.get('mean_gap_percent')}%")
         elif "mean_combined_score" in full_test:
