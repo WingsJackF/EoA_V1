@@ -38,7 +38,15 @@ def _prepare_candidate(program_code: str):
     return candidate_module
 
 
-def _evaluate_sizes(program_code: str, *, mode: str, problem_sizes: tuple[int, ...], episodes: int, batch_size: int) -> Dict[str, Dict[str, float]]:
+def _evaluate_sizes(
+    program_code: str,
+    *,
+    mode: str,
+    problem_sizes: tuple[int, ...],
+    episodes: int,
+    batch_size: int,
+    report: bool = False,
+) -> Dict[str, Dict[str, float]]:
     p = problem_dir("tsp_pomo")
     checkpoint = p / "checkpoints" / "checkpoint-3100.pt"
     if not checkpoint.is_file():
@@ -70,7 +78,8 @@ def _evaluate_sizes(program_code: str, *, mode: str, problem_sizes: tuple[int, .
                 "objective": objective,
                 "combined_score": -objective,
             }
-            print_full_test_problem_result(problem_size, results[str(problem_size)])
+            if report:
+                print_full_test_problem_result(problem_size, results[str(problem_size)])
     return results
 
 
@@ -108,6 +117,7 @@ def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
             problem_sizes=tuple(dataset_conf[mode]),
             episodes=FULL_TEST_EPISODES,
             batch_size=FULL_TEST_BATCH_SIZE,
+            report=True,
         )
         mean_combined_score = float(sum(item["combined_score"] for item in per_size.values()) / len(per_size))
         return {

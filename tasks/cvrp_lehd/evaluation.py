@@ -67,7 +67,13 @@ def _ensure_assets():
     return p
 
 
-def _evaluate_sizes(program_code: str, *, test_paras: Dict[int, list], problem_sizes: tuple[int, ...]) -> Dict[str, Dict[str, float]]:
+def _evaluate_sizes(
+    program_code: str,
+    *,
+    test_paras: Dict[int, list],
+    problem_sizes: tuple[int, ...],
+    report: bool = False,
+) -> Dict[str, Dict[str, float]]:
     p = _ensure_assets()
     candidate_module = _prepare_candidate(program_code)
     results: Dict[str, Dict[str, float]] = {}
@@ -92,7 +98,8 @@ def _evaluate_sizes(program_code: str, *, test_paras: Dict[int, list], problem_s
                 "gap_percent": gap,
                 "combined_score": -score_student,
             }
-            print_full_test_problem_result(problem_size, results[str(problem_size)])
+            if report:
+                print_full_test_problem_result(problem_size, results[str(problem_size)])
     return results
 
 
@@ -124,6 +131,7 @@ def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
             program_code,
             test_paras=FULL_TEST_PARAS[mode],
             problem_sizes=FULL_TEST_PROBLEM_SIZES,
+            report=True,
         )
         mean_gap_percent = sum(item["gap_percent"] for item in per_size.values()) / len(per_size)
         return {
