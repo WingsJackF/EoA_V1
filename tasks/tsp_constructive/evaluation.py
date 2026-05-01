@@ -9,6 +9,7 @@ import numpy as np
 from scipy.spatial import distance_matrix
 
 from tasks.task_support.paths import problem_dir
+from tasks.task_support.reporting import print_full_test_problem_result
 from tasks.task_support.runtime import (
     import_problem_module,
     installed_module,
@@ -99,6 +100,7 @@ def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
                 "objective": avg_obj,
                 "combined_score": -avg_obj,
             }
+            print_full_test_problem_result(problem_size, size_to_objective[str(problem_size)])
         mean_combined_score = float(np.mean([x["combined_score"] for x in size_to_objective.values()]))
         return {
             "mode": mode,

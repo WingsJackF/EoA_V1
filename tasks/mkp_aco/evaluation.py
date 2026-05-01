@@ -13,6 +13,7 @@ from tasks.task_support.eval_timeout import run_spawn_eval_jobs
 from tasks.task_support.gpu import gpu_requested, solver_device, visible_gpu_ids
 from tasks.task_support.paths import problem_dir
 from tasks.task_support.processes import cleanup_process_pool
+from tasks.task_support.reporting import print_full_test_problem_result
 from tasks.task_support.runtime import import_problem_module, load_program_module, resolve_callable
 
 MAX_INSTANCES = 5
@@ -224,6 +225,7 @@ def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
                 "objective": avg_obj,
                 "combined_score": avg_obj,
             }
+            print_full_test_problem_result(problem_size, size_to_objective[str(problem_size)])
         mean_combined_score = float(np.mean([x["combined_score"] for x in size_to_objective.values()]))
         return {"mode": mode, "problem_sizes": size_to_objective, "mean_combined_score": mean_combined_score, "error": None}
     except Exception as e:

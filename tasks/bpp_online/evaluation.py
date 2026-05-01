@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict
 import numpy as np
 
 from tasks.task_support.paths import problem_dir
+from tasks.task_support.reporting import print_full_test_problem_result
 from tasks.task_support.runtime import import_problem_module, load_program_module, resolve_callable
 
 POSSIBLE_NAMES = ("priority", "priority_v1", "priority_v2", "priority_v3")
@@ -88,6 +89,7 @@ def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
             "excess_percent": excess_percent,
             "combined_score": -excess_percent,
         }
+        print_full_test_problem_result(5000, result)
         return {
             "mode": mode,
             "resolved_mode": resolved_mode,

@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 from tasks.task_support.gpu import apply_module_gpu_overrides
 from tasks.task_support.paths import problem_dir
+from tasks.task_support.reporting import print_full_test_problem_result
 from tasks.task_support.runtime import (
     installed_module,
     load_program_module,
@@ -69,6 +70,7 @@ def _evaluate_sizes(program_code: str, *, mode: str, problem_sizes: tuple[int, .
                 "objective": objective,
                 "combined_score": -objective,
             }
+            print_full_test_problem_result(problem_size, results[str(problem_size)])
     return results
 
 

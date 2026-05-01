@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 from tasks.task_support.gpu import apply_module_gpu_overrides, gpu_requested, logical_cuda_device_num
 from tasks.task_support.paths import problem_dir
+from tasks.task_support.reporting import print_full_test_problem_result
 from tasks.task_support.runtime import (
     installed_module,
     load_program_module,
@@ -91,6 +92,7 @@ def _evaluate_sizes(program_code: str, *, test_paras: Dict[int, list], problem_s
                 "gap_percent": gap,
                 "combined_score": -score_student,
             }
+            print_full_test_problem_result(problem_size, results[str(problem_size)])
     return results
 
 

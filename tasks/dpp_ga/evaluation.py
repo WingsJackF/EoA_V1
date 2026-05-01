@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict
 import numpy as np
 
 from tasks.task_support.paths import problem_dir
+from tasks.task_support.reporting import print_full_test_problem_result
 from tasks.task_support.runtime import import_problem_module, installed_module, load_program_module, resolve_callable
 
 POSSIBLE_NAMES = ("crossover", "crossover_v1", "crossover_v2", "crossover_v3")
@@ -72,13 +73,15 @@ def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
             eval_mod.test_prohibit = test_prohibit[-64:]
             eval_mod.keepout_num = keepout_num[-64:]
             avg_reward = float(eval_mod.run_ga(20, 10, 64, 0.2, 20, reward_model))
+        metrics = {
+            "average_reward": avg_reward,
+            "combined_score": avg_reward,
+        }
+        print_full_test_problem_result(mode, metrics)
         return {
             "mode": mode,
             "problem_sizes": {
-                mode: {
-                    "average_reward": avg_reward,
-                    "combined_score": avg_reward,
-                }
+                mode: metrics
             },
             "mean_combined_score": avg_reward,
             "error": None,

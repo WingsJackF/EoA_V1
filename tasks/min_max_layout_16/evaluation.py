@@ -10,6 +10,7 @@ from typing import Any, Dict
 import numpy as np
 import scipy as sp
 
+from tasks.task_support.reporting import print_full_test_problem_result
 from tasks.min_max_layout_16.constants import TARGET_FUNCTION_NAME
 
 
@@ -83,6 +84,7 @@ def run_full_test(program_code: str, *, mode: str = "test") -> Dict[str, Any]:
         "min_max_ratio": result.get("min_max_ratio"),
         "eval_time": result.get("eval_time"),
     }
+    print_full_test_problem_result(16, metrics)
     return {
         "mode": mode,
         "problem_sizes": {"16": metrics},
