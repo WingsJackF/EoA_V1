@@ -101,12 +101,48 @@ DEFAULT_STRATEGY_RATIOS = {
     "exploration": 0.4,
     "simplification": 0.2,
 }
+STRATEGY_ABLATION_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "none": {
+        "ratios": DEFAULT_STRATEGY_RATIOS,
+        "adaptive_strategy": True,
+    },
+    "no-exploration": {
+        "ratios": {
+            "modification": 0.5,
+            "exploration": 0.0,
+            "simplification": 0.5,
+        },
+        "adaptive_strategy": True,
+    },
+    "no-simplification": {
+        "ratios": {
+            "modification": 0.5,
+            "exploration": 0.5,
+            "simplification": 0.0,
+        },
+        "adaptive_strategy": True,
+    },
+    "no-adaptive": {
+        "ratios": DEFAULT_STRATEGY_RATIOS,
+        "adaptive_strategy": False,
+    },
+}
 DEFAULT_LLM_CONCURRENCY = 8
 DEFAULT_LLM_POST_TIMEOUT = 180.0
 DEFAULT_EVAL_CONCURRENCY = 2
 DEFAULT_EVAL_TIMEOUT_SECONDS = 30.0
 # LLM：见 implement_llm_interaction_module/llm_config.py（环境变量 / --llm-* / LLM_CONFIG_FILE）
 # -------------------------------------------------------
+
+
+def _resolve_strategy_ablation(ablation: str) -> tuple[Dict[str, float], bool]:
+    try:
+        config = STRATEGY_ABLATION_CONFIGS[ablation]
+    except KeyError as e:
+        raise ValueError(f"Unknown strategy ablation: {ablation}") from e
+    ratios = dict(config["ratios"])
+    adaptive_strategy = bool(config["adaptive_strategy"])
+    return ratios, adaptive_strategy
 
 
 def _log_llm_settings() -> None:
@@ -185,6 +221,9 @@ def main(
     eval_concurrency: int = DEFAULT_EVAL_CONCURRENCY,
     eval_gpu_logical_ids: Optional[List[int]] = None,
     eval_timeout_seconds: Optional[float] = DEFAULT_EVAL_TIMEOUT_SECONDS,
+    strategy_ratios: Optional[Dict[str, float]] = None,
+    adaptive_strategy: bool = True,
+    strategy_ablation: str = "none",
 ) -> List[Dict[str, Any]]:
     """
     Main evolutionary loop orchestration.
@@ -201,6 +240,12 @@ def main(
         raise ValueError("llm_concurrency must be a positive integer")
     if eval_concurrency <= 0:
         raise ValueError("eval_concurrency must be a positive integer")
+    resolved_strategy_ratios = dict(strategy_ratios or DEFAULT_STRATEGY_RATIOS)
+    safe_print(
+        "Strategy ablation: "
+        f"{strategy_ablation}; ratios={resolved_strategy_ratios}; "
+        f"adaptive_strategy={'on' if adaptive_strategy else 'off'}"
+    )
     safe_print(
         "Initializing population with seed individual "
         f"(llm_concurrency={llm_concurrency}, eval_concurrency={eval_concurrency})..."
@@ -284,7 +329,13 @@ def main(
             label="initial",
             population=population,
             archive=[population[0]],
-            extra={"POPULATION_SIZE": POPULATION_SIZE, "GENERATIONS": GENERATIONS},
+            extra={
+                "POPULATION_SIZE": POPULATION_SIZE,
+                "GENERATIONS": GENERATIONS,
+                "strategy_ablation": strategy_ablation,
+                "strategy_ratios": resolved_strategy_ratios,
+                "adaptive_strategy": adaptive_strategy,
+            },
         )
 
     # Initialize archive with seed individual
@@ -304,17 +355,20 @@ def main(
             "generation": gen,
             "recent_scores": best_history[-5:],
             "stagnation_count": stagnation_count,
-            "default_ratios": DEFAULT_STRATEGY_RATIOS,
+            "default_ratios": resolved_strategy_ratios,
+            "adaptive_strategy": adaptive_strategy,
             # optional deterministic sampling seed is omitted for stochasticity
         }
 
         # Decide strategies for each offspring to produce
         offspring_raw_contents: List[str] = []
         strategies_used: List[str] = []
+        strategy_probabilities: Optional[Dict[str, float]] = None
         prepared_offspring_requests: List[tuple[int, Dict[str, Any]]] = []
         for off_idx in range(OFFSPRING_PER_GEN):
             try:
                 chosen_strategy, probs = define_strategy_selection_policy(context)
+                strategy_probabilities = probs
             except Exception as e:
                 # Catch-all here is only for the outer control flow; use specific exception types where possible.
                 safe_print(f"Strategy selection failed: {e}")
@@ -466,6 +520,9 @@ def main(
                 archive=archive,
                 extra={
                     "strategies_used": strategies_used,
+                    "strategy_probabilities": strategy_probabilities,
+                    "strategy_ablation": strategy_ablation,
+                    "adaptive_strategy": adaptive_strategy,
                     "offspring_raw_count": len(offspring_raw_contents),
                     "offspring_evaluated_count": len(valid_offspring),
                     "offspring_failed_count": invalid_offspring_count,
@@ -695,6 +752,17 @@ if __name__ == "__main__":
     parser.add_argument("--offspring-per-gen", type=int, default=OFFSPRING_PER_GEN, help="覆盖每代后代数")
     parser.add_argument("--elitism-count", type=int, default=ELITISM_COUNT, help="覆盖精英保留数")
     parser.add_argument(
+        "--strategy-ablation",
+        choices=sorted(STRATEGY_ABLATION_CONFIGS.keys()),
+        default="none",
+        help=(
+            "策略消融：none=默认自适应 0.4/0.4/0.2；"
+            "no-exploration=只用 modification+simplification；"
+            "no-simplification=只用 modification+exploration；"
+            "no-adaptive=固定 0.4/0.4/0.2，关闭自适应"
+        ),
+    )
+    parser.add_argument(
         "--eval-timeout",
         type=float,
         default=DEFAULT_EVAL_TIMEOUT_SECONDS,
@@ -742,6 +810,7 @@ if __name__ == "__main__":
     GENERATIONS = max(1, int(args.generations))
     OFFSPRING_PER_GEN = max(1, int(args.offspring_per_gen))
     ELITISM_COUNT = max(1, min(int(args.elitism_count), POPULATION_SIZE))
+    strategy_ratios, adaptive_strategy = _resolve_strategy_ablation(args.strategy_ablation)
 
     import os
 
@@ -802,6 +871,9 @@ if __name__ == "__main__":
                 "gpu_requested": gpu_requested(),
                 "visible_gpu": visible_gpu() or None,
                 "eval_timeout_seconds": eval_timeout_param,
+                "strategy_ablation": args.strategy_ablation,
+                "strategy_ratios": strategy_ratios,
+                "adaptive_strategy": adaptive_strategy,
             },
         )
 
@@ -830,6 +902,9 @@ if __name__ == "__main__":
                         eval_concurrency=args.eval_concurrency,
                         eval_gpu_logical_ids=eval_gpu_logical_ids,
                         eval_timeout_seconds=eval_timeout_param,
+                        strategy_ratios=strategy_ratios,
+                        adaptive_strategy=adaptive_strategy,
+                        strategy_ablation=args.strategy_ablation,
                     )
                     if args.full_test:
                         run_full_test_for_archive(
@@ -868,6 +943,9 @@ if __name__ == "__main__":
                     eval_concurrency=args.eval_concurrency,
                     eval_gpu_logical_ids=eval_gpu_logical_ids,
                     eval_timeout_seconds=eval_timeout_param,
+                    strategy_ratios=strategy_ratios,
+                    adaptive_strategy=adaptive_strategy,
+                    strategy_ablation=args.strategy_ablation,
                 )
                 if args.full_test:
                     run_full_test_for_archive(

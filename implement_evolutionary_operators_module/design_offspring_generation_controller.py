@@ -17,6 +17,7 @@ Usage:
       - recent_scores: list[float] (optional)
       - stagnation_count: int (optional)
       - default_ratios: dict (optional) with keys 'modification','exploration','simplification'
+      - adaptive_strategy: bool (optional, default True)
 
 Returns:
     (chosen_strategy: str, probabilities: Dict[str, float])
@@ -63,6 +64,7 @@ def define_strategy_selection_policy(
             - recent_scores: list[float] (optional)
             - stagnation_count: int (optional)
             - default_ratios: Dict[str, float] (optional)
+            - adaptive_strategy: bool (optional)
 
     Returns:
         (strategy, probabilities): Tuple of selected strategy string and the
@@ -89,23 +91,30 @@ def define_strategy_selection_policy(
     else:
         ratios = default_ratios.copy()
 
-    # Adaptive adjustments
-    # If stagnation is high, boost exploration
-    if stagnation >= 5:
-        # Increase exploration moderately, reduce others proportionally
-        boost = 0.3
-        ratios["exploration"] = ratios.get("exploration", 0.0) + boost
-        # Reduce others proportionally (avoid going negative)
-        reduction = boost / 2.0
-        ratios["modification"] = max(0.0, ratios.get("modification", 0.0) - reduction)
-        ratios["simplification"] = max(0.0, ratios.get("simplification", 0.0) - reduction)
-    # Early generation: encourage exploration
-    elif gen < 5:
-        boost = 0.2
-        ratios["exploration"] = ratios.get("exploration", 0.0) + boost
-        reduction = boost / 2.0
-        ratios["modification"] = max(0.0, ratios.get("modification", 0.0) - reduction)
-        ratios["simplification"] = max(0.0, ratios.get("simplification", 0.0) - reduction)
+    adaptive_enabled = bool(context.get("adaptive_strategy", True))
+    exploration_is_active = ratios.get("exploration", 0.0) > 0.0
+
+    # Adaptive adjustments. Strategies explicitly set to zero stay disabled for ablations.
+    if adaptive_enabled and exploration_is_active:
+        # If stagnation is high, boost exploration.
+        if stagnation >= 5:
+            boost = 0.3
+        # Early generation: encourage exploration.
+        elif gen < 5:
+            boost = 0.2
+        else:
+            boost = 0.0
+
+        if boost > 0.0:
+            ratios["exploration"] = ratios.get("exploration", 0.0) + boost
+            reducible = [
+                key for key in ("modification", "simplification")
+                if ratios.get(key, 0.0) > 0.0
+            ]
+            if reducible:
+                reduction = boost / len(reducible)
+                for key in reducible:
+                    ratios[key] = max(0.0, ratios.get(key, 0.0) - reduction)
     # Else: keep provided/default ratios
 
     # Normalize to valid probabilities
