@@ -33,23 +33,24 @@ COMMON_ARGS = [
 ]
 
 
-def build_commands(python_executable: str) -> list[list[str]]:
+def build_commands(python_executable: str, output_root: Path | None = None) -> list[list[str]]:
     script_dir = Path(__file__).resolve().parent
     main_py = script_dir / "main.py"
     commands: list[list[str]] = []
     for ablation in ABLATIONS:
         for task in TASKS:
-            commands.append(
-                [
-                    python_executable,
-                    str(main_py),
-                    "--task",
-                    task,
-                    "--strategy-ablation",
-                    ablation,
-                    *COMMON_ARGS,
-                ]
-            )
+            command = [
+                python_executable,
+                str(main_py),
+                "--task",
+                task,
+                "--strategy-ablation",
+                ablation,
+                *COMMON_ARGS,
+            ]
+            if output_root is not None:
+                command.extend(["--output-dir", str(output_root / ablation / task)])
+            commands.append(command)
     return commands
 
 
@@ -72,9 +73,16 @@ def main() -> int:
         action="store_true",
         help="Continue running later experiments if one command fails.",
     )
+    parser.add_argument(
+        "--output-root",
+        default=None,
+        metavar="PATH",
+        help="Optional root directory for experiment outputs; each run uses <root>/<ablation>/<task>.",
+    )
     args = parser.parse_args()
 
-    commands = build_commands(args.python)
+    output_root = Path(args.output_root).expanduser() if args.output_root else None
+    commands = build_commands(args.python, output_root=output_root)
     total = len(commands)
     failures: list[tuple[int, list[str], int]] = []
 

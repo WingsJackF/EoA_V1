@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sys
 import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -914,6 +916,12 @@ if __name__ == "__main__":
         action="store_true",
         help="不创建 output/<task>/<时间戳>/ 目录（默认每次运行都会记录终端与演化快照）",
     )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        metavar="PATH",
+        help="指定本次运行的输出目录；提供后直接作为 run directory 使用，不再追加 task/时间戳。",
+    )
     gpu_group = parser.add_mutually_exclusive_group()
     gpu_group.add_argument(
         "--gpu",
@@ -979,11 +987,20 @@ if __name__ == "__main__":
     eoa_root = Path(__file__).resolve().parent
     run_dir: Optional[Path] = None
     task = get_task(args.task)
-    persist_run_output = (not args.no_run_output) or args.full_test or standalone_test
+    persist_run_output = (not args.no_run_output) or args.full_test or standalone_test or bool(args.output_dir)
     if args.no_run_output and (args.full_test or standalone_test):
         print("[info] full test output requires persisted output; creating output directory anyway.", flush=True)
+    if args.no_run_output and args.output_dir:
+        print("[info] --output-dir requires persisted output; ignoring --no-run-output.", flush=True)
     if persist_run_output:
-        run_dir = make_run_output_dir(eoa_root, args.task)
+        if args.output_dir:
+            run_dir = Path(args.output_dir).expanduser()
+            if not run_dir.is_absolute():
+                run_dir = Path.cwd() / run_dir
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "evolution").mkdir(exist_ok=True)
+        else:
+            run_dir = make_run_output_dir(eoa_root, args.task)
         if standalone_test:
             llm_meta = {"skipped": True, "reason": "standalone_full_test"}
         else:
@@ -1014,6 +1031,7 @@ if __name__ == "__main__":
                 "strategy_ablation": args.strategy_ablation,
                 "strategy_ratios": strategy_ratios,
                 "adaptive_strategy": adaptive_strategy,
+                "output_dir_argument": args.output_dir,
             },
         )
 
