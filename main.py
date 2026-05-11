@@ -46,6 +46,7 @@ Note:
 """
 
 import argparse
+import math
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -100,6 +101,13 @@ DEFAULT_STRATEGY_RATIOS = {
     "modification": 0.4,
     "exploration": 0.4,
     "simplification": 0.2,
+}
+STRATEGY_NAMES = ("modification", "exploration", "simplification")
+PARENT_SELECTION_POLICY = {
+    "mode": "fitness_tournament",
+    "tournament_size": 3,
+    "top_fraction": 0.6,
+    "random_parent_probability": 0.15,
 }
 STRATEGY_ABLATION_CONFIGS: Dict[str, Dict[str, Any]] = {
     "none": {
@@ -183,6 +191,80 @@ def _summarize_individual(ind: Dict[str, Any]) -> str:
         cs = None
     thought = (ind.get("thought") or "")[:120]
     return f"combined_score={cs}, thought={thought}"
+
+
+def _score_of(ind: Dict[str, Any]) -> Optional[float]:
+    try:
+        return float(ind.get("fitness", {}).get("combined_score"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _best_score(population: List[Dict[str, Any]], default: float = 0.0) -> float:
+    scores = [_score_of(ind) for ind in population]
+    valid_scores = [score for score in scores if score is not None]
+    return max(valid_scores) if valid_scores else default
+
+
+def _new_strategy_stats() -> Dict[str, Dict[str, Any]]:
+    return {
+        strategy: {
+            "attempted": 0,
+            "llm_success": 0,
+            "evaluated": 0,
+            "valid": 0,
+            "invalid": 0,
+            "parent_improvements": 0,
+            "best_improvements": 0,
+            "score_gain_total": 0.0,
+            "best_score": None,
+            "score_total": 0.0,
+        }
+        for strategy in STRATEGY_NAMES
+    }
+
+
+def _merge_strategy_stats(
+    total: Dict[str, Dict[str, Any]],
+    update: Dict[str, Dict[str, Any]],
+) -> None:
+    for strategy in STRATEGY_NAMES:
+        dst = total.setdefault(strategy, {})
+        src = update.get(strategy, {})
+        for key in (
+            "attempted",
+            "llm_success",
+            "evaluated",
+            "valid",
+            "invalid",
+            "parent_improvements",
+            "best_improvements",
+        ):
+            dst[key] = int(dst.get(key, 0) or 0) + int(src.get(key, 0) or 0)
+        for key in ("score_gain_total", "score_total"):
+            dst[key] = float(dst.get(key, 0.0) or 0.0) + float(src.get(key, 0.0) or 0.0)
+        src_best = src.get("best_score")
+        dst_best = dst.get("best_score")
+        if src_best is not None and (dst_best is None or float(src_best) > float(dst_best)):
+            dst["best_score"] = float(src_best)
+
+
+def _format_strategy_stats(stats: Dict[str, Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for strategy in STRATEGY_NAMES:
+        record = stats.get(strategy, {})
+        attempted = int(record.get("attempted", 0) or 0)
+        valid = int(record.get("valid", 0) or 0)
+        parent_improvements = int(record.get("parent_improvements", 0) or 0)
+        best_improvements = int(record.get("best_improvements", 0) or 0)
+        valid_rate = (valid / attempted) if attempted else 0.0
+        improve_rate = (parent_improvements / valid) if valid else 0.0
+        parts.append(
+            f"{strategy}: attempted={attempted}, valid={valid}, "
+            f"valid_rate={valid_rate:.2f}, parent_improve_rate={improve_rate:.2f}, "
+            f"new_best={best_improvements}"
+        )
+    return " | ".join(parts)
 
 
 def _format_full_test_metrics(metrics: Any) -> str:
@@ -322,13 +404,16 @@ def main(
     for idx, ind in enumerate(population, start=1):
         safe_print(f"  Individual {idx}: {_summarize_individual(ind)}")
 
+    # Initialize archive with the strongest evaluated initial individuals.
+    archive: List[Dict[str, Any]] = archive_best_individuals([], population, max_archive_size=20)
+
     if output_run_dir is not None:
         save_generation_snapshot(
             output_run_dir,
             generation=0,
             label="initial",
             population=population,
-            archive=[population[0]],
+            archive=archive,
             extra={
                 "POPULATION_SIZE": POPULATION_SIZE,
                 "GENERATIONS": GENERATIONS,
@@ -338,13 +423,11 @@ def main(
             },
         )
 
-    # Initialize archive with seed individual
-    archive: List[Dict[str, Any]] = [population[0]]
-
     # Track progress for strategy adaptation
     best_history: List[float] = []
     stagnation_count = 0
-    best_combined_score = population[0].get("fitness", {}).get("combined_score", 0.0)
+    best_combined_score = _best_score(population, default=0.0)
+    strategy_stats = _new_strategy_stats()
 
     prompt_strategies = task.prompt_strategies
 
@@ -357,14 +440,18 @@ def main(
             "stagnation_count": stagnation_count,
             "default_ratios": resolved_strategy_ratios,
             "adaptive_strategy": adaptive_strategy,
+            "strategy_stats": strategy_stats,
             # optional deterministic sampling seed is omitted for stochasticity
         }
 
         # Decide strategies for each offspring to produce
         offspring_raw_contents: List[str] = []
+        offspring_raw_metadata: List[Dict[str, Any]] = []
         strategies_used: List[str] = []
         strategy_probabilities: Optional[Dict[str, float]] = None
-        prepared_offspring_requests: List[tuple[int, Dict[str, Any]]] = []
+        generation_strategy_stats = _new_strategy_stats()
+        generation_start_best = best_combined_score
+        prepared_offspring_requests: List[tuple[int, str, Dict[str, Any], Dict[str, Any]]] = []
         for off_idx in range(OFFSPRING_PER_GEN):
             try:
                 chosen_strategy, probs = define_strategy_selection_policy(context)
@@ -377,20 +464,28 @@ def main(
 
             # Orchestrate parent selection and prompt preparation
             try:
-                payload = orchestrate_parent_selection_and_prompt_preparation(
-                    population, chosen_strategy, prompt_strategies
+                prepared = orchestrate_parent_selection_and_prompt_preparation(
+                    population,
+                    chosen_strategy,
+                    prompt_strategies,
+                    parent_selection_policy=PARENT_SELECTION_POLICY,
+                    return_metadata=True,
                 )
             except (ValueError, TypeError) as e:
                 safe_print(f"Parent selection / prompt preparation failed: {e}")
                 continue
-            prepared_offspring_requests.append((off_idx, payload))
+            payload = prepared["payload"]
+            selection_metadata = dict(prepared.get("selection", {}))
+            selection_metadata["offspring_index"] = off_idx
+            generation_strategy_stats[chosen_strategy]["attempted"] += 1
+            prepared_offspring_requests.append((off_idx, chosen_strategy, payload, selection_metadata))
 
         safe_print(
             f"Dispatching {len(prepared_offspring_requests)} LLM requests for generation {gen} "
             f"(llm_concurrency={llm_concurrency})..."
         )
         request_results = implement_post_requests_concurrently(
-            [payload for _, payload in prepared_offspring_requests],
+            [payload for _, _, payload, _ in prepared_offspring_requests],
             max_retries=5,
             base_backoff=2.0,
             timeout=DEFAULT_LLM_POST_TIMEOUT,
@@ -398,7 +493,7 @@ def main(
             max_concurrency=llm_concurrency,
         )
 
-        for (off_idx, _payload), response_result in zip(prepared_offspring_requests, request_results):
+        for (off_idx, chosen_strategy, _payload, selection_metadata), response_result in zip(prepared_offspring_requests, request_results):
             if isinstance(response_result, Exception):
                 safe_print(f"LLM request failed for offspring {off_idx+1} in gen {gen}: {response_result}")
                 continue
@@ -410,7 +505,9 @@ def main(
                 safe_print(f"Unexpected LLM response structure for offspring {off_idx+1} in gen {gen}: {e}")
                 continue
 
+            generation_strategy_stats[chosen_strategy]["llm_success"] += 1
             offspring_raw_contents.append(raw_content)
+            offspring_raw_metadata.append(selection_metadata)
 
         safe_print(f"Generated {len(offspring_raw_contents)} offspring (strategies: {strategies_used})")
         safe_print(
@@ -436,6 +533,43 @@ def main(
             safe_print(f"Integration type error: {te}")
             evaluated_offspring = []
 
+        for off, metadata in zip(evaluated_offspring, offspring_raw_metadata):
+            strategy = str(metadata.get("strategy", "modification"))
+            if strategy not in generation_strategy_stats:
+                continue
+            generation_strategy_stats[strategy]["evaluated"] += 1
+            off["evolution"] = {
+                "generation": gen,
+                "offspring_index": metadata.get("offspring_index"),
+                "strategy": strategy,
+                "parent_scores": metadata.get("parent_scores", []),
+                "parent_best_score": metadata.get("parent_best_score"),
+                "parent_selection_policy": metadata.get("parent_selection_policy", {}),
+            }
+            if individual_is_valid(off):
+                generation_strategy_stats[strategy]["valid"] += 1
+                score = _score_of(off)
+                if score is not None:
+                    generation_strategy_stats[strategy]["score_total"] += score
+                    best_seen = generation_strategy_stats[strategy]["best_score"]
+                    if best_seen is None or score > float(best_seen):
+                        generation_strategy_stats[strategy]["best_score"] = score
+                    parent_best = metadata.get("parent_best_score")
+                    if isinstance(parent_best, (int, float)) and math.isfinite(float(parent_best)):
+                        score_gain = score - float(parent_best)
+                        generation_strategy_stats[strategy]["score_gain_total"] += score_gain
+                        if score_gain > 1e-12:
+                            generation_strategy_stats[strategy]["parent_improvements"] += 1
+                    if score > generation_start_best + 1e-12:
+                        generation_strategy_stats[strategy]["best_improvements"] += 1
+            else:
+                generation_strategy_stats[strategy]["invalid"] += 1
+
+        for metadata in offspring_raw_metadata[len(evaluated_offspring):]:
+            strategy = str(metadata.get("strategy", "modification"))
+            if strategy in generation_strategy_stats:
+                generation_strategy_stats[strategy]["invalid"] += 1
+
         valid_offspring = [off for off in evaluated_offspring if individual_is_valid(off)]
         invalid_offspring_count = len(evaluated_offspring) - len(valid_offspring)
         if invalid_offspring_count:
@@ -444,6 +578,7 @@ def main(
         safe_print(f"Evaluated offspring count: {len(valid_offspring)}")
         for idx, off in enumerate(valid_offspring, start=1):
             safe_print(f"  Offspring {idx}: {_summarize_individual(off)}")
+        safe_print(f"Strategy stats this generation: {_format_strategy_stats(generation_strategy_stats)}")
 
         # Combine population and offspring for selection
         combined_population = population + valid_offspring
@@ -506,6 +641,8 @@ def main(
             stagnation_count += 1
             safe_print(f"No improvement this generation (stagnation_count={stagnation_count})")
 
+        _merge_strategy_stats(strategy_stats, generation_strategy_stats)
+
         # Print brief population summary
         safe_print("Population summary (top entries):")
         for i, ind in enumerate(sorted(population, key=lambda x: float(x.get("fitness", {}).get("combined_score", 0.0)), reverse=True)[:5], start=1):
@@ -521,6 +658,9 @@ def main(
                 extra={
                     "strategies_used": strategies_used,
                     "strategy_probabilities": strategy_probabilities,
+                    "parent_selection_policy": PARENT_SELECTION_POLICY,
+                    "generation_strategy_stats": generation_strategy_stats,
+                    "cumulative_strategy_stats": strategy_stats,
                     "strategy_ablation": strategy_ablation,
                     "adaptive_strategy": adaptive_strategy,
                     "offspring_raw_count": len(offspring_raw_contents),

@@ -115,6 +115,35 @@ def define_strategy_selection_policy(
                 reduction = boost / len(reducible)
                 for key in reducible:
                     ratios[key] = max(0.0, ratios.get(key, 0.0) - reduction)
+
+    strategy_stats = context.get("strategy_stats")
+    if adaptive_enabled and isinstance(strategy_stats, dict):
+        for key in ("modification", "exploration", "simplification"):
+            if ratios.get(key, 0.0) <= 0.0:
+                continue
+            record = strategy_stats.get(key, {})
+            if not isinstance(record, dict):
+                continue
+            attempted = float(record.get("attempted", 0) or 0)
+            if attempted < 3:
+                continue
+            valid = float(record.get("valid", 0) or 0)
+            invalid = float(record.get("invalid", 0) or 0)
+            parent_improvements = float(record.get("parent_improvements", 0) or 0)
+            best_improvements = float(record.get("best_improvements", 0) or 0)
+
+            valid_rate = valid / attempted if attempted > 0 else 0.0
+            invalid_rate = invalid / attempted if attempted > 0 else 0.0
+            parent_improve_rate = parent_improvements / valid if valid > 0 else 0.0
+            best_rate = best_improvements / attempted if attempted > 0 else 0.0
+            quality = (
+                0.45 * parent_improve_rate
+                + 0.35 * valid_rate
+                + 0.20 * min(1.0, best_rate * 4.0)
+                - 0.25 * invalid_rate
+            )
+            multiplier = max(0.50, min(1.80, 0.65 + quality))
+            ratios[key] = ratios.get(key, 0.0) * multiplier
     # Else: keep provided/default ratios
 
     # Normalize to valid probabilities
@@ -147,16 +176,16 @@ Description:
     Orchestrates parent selection from the current population according to a chosen
     evolutionary strategy and prepares the final API request payload for the LLM.
     The function supports three strategies:
-      - "modification": select one parent randomly and request a targeted improvement
-      - "simplification": select one parent randomly and request a simplification
-      - "exploration": select two parents (or more) randomly and request synthesis
+      - "modification": select one fitness-biased parent and request a targeted improvement
+      - "simplification": select one fitness-biased parent and request a simplification
+      - "exploration": select two fitness-biased parents and request synthesis
 
     The function returns a payload dictionary ready to be sent to the LLM chat/completions
     endpoint via the project's API wrapper (construct_api_request_payload).
 
 Notes:
     - This module does not perform any LLM calls or fitness evaluation itself.
-    - Parent selection uses Python's random module to ensure diversity.
+    - Parent selection uses tournament pressure plus a small random branch for diversity.
     - The function expects prompt_strategies to be a mapping from strategy name to a
       callable that returns (system_prompt, user_prompt) when provided the appropriate
       parent(s).
@@ -171,11 +200,79 @@ from implement_llm_interaction_module.develop_api_wrapper import construct_api_r
 from implement_llm_interaction_module.llm_config import get_llm_settings  # type: ignore
 
 
+def _combined_score_of(individual: Dict[str, Any]) -> float:
+    fitness = individual.get("fitness", {})
+    if not isinstance(fitness, dict):
+        return float("-inf")
+    try:
+        return float(fitness.get("combined_score", float("-inf")))
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _parent_summary(parent: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(parent.get("code", ""))
+    thought = str(parent.get("thought", ""))
+    return {
+        "combined_score": _combined_score_of(parent),
+        "thought_preview": thought[:120],
+        "code_length": len(code),
+    }
+
+
+def _select_parent_by_fitness(
+    population: List[Dict[str, Any]],
+    *,
+    tournament_size: int = 3,
+    top_fraction: float = 0.6,
+    random_parent_probability: float = 0.15,
+) -> Dict[str, Any]:
+    if not population:
+        raise ValueError("population is empty; cannot select parents")
+    if random.random() < random_parent_probability:
+        return random.choice(population)
+
+    ranked = sorted(population, key=_combined_score_of, reverse=True)
+    top_count = max(1, int(len(ranked) * top_fraction))
+    top_count = min(len(ranked), max(top_count, tournament_size))
+    candidate_pool = ranked[:top_count]
+    k = min(max(1, tournament_size), len(candidate_pool))
+    contestants = random.sample(candidate_pool, k=k)
+    return max(contestants, key=_combined_score_of)
+
+
+def _select_parents_by_fitness(
+    population: List[Dict[str, Any]],
+    count: int,
+    *,
+    tournament_size: int = 3,
+    top_fraction: float = 0.6,
+    random_parent_probability: float = 0.15,
+) -> List[Dict[str, Any]]:
+    remaining = list(population)
+    selected: List[Dict[str, Any]] = []
+    for _ in range(min(count, len(remaining))):
+        parent = _select_parent_by_fitness(
+            remaining,
+            tournament_size=tournament_size,
+            top_fraction=top_fraction,
+            random_parent_probability=random_parent_probability,
+        )
+        selected.append(parent)
+        for idx, item in enumerate(remaining):
+            if item is parent:
+                del remaining[idx]
+                break
+    return selected
+
+
 def orchestrate_parent_selection_and_prompt_preparation(
     population: List[Dict[str, Any]],
     strategy: str,
     prompt_strategies: Dict[str, Callable[..., tuple]],
     model: Optional[str] = None,
+    parent_selection_policy: Optional[Dict[str, Any]] = None,
+    return_metadata: bool = False,
 ) -> Dict[str, Any]:
     """
     Selects parent(s) according to strategy, prepares prompts, and constructs API payload.
@@ -189,6 +286,8 @@ def orchestrate_parent_selection_and_prompt_preparation(
                              accept a single parent dict and return (system_prompt, user_prompt).
                            - For 'exploration', the function should accept a list of parent dicts.
         model: 模型名；默认 ``get_llm_settings().model``。
+        parent_selection_policy: 父代选择参数。默认使用 fitness-aware tournament。
+        return_metadata: 为 True 时返回 {"payload": ..., "selection": ...}。
 
     Returns:
         API request payload (dict) ready for LLM interaction. Uses construct_api_request_payload.
@@ -213,16 +312,35 @@ def orchestrate_parent_selection_and_prompt_preparation(
     if not callable(prompt_fn):
         raise TypeError(f"Prompt strategy for '{strategy}' is not callable")
 
+    selection_policy = parent_selection_policy or {}
+    tournament_size = int(selection_policy.get("tournament_size", 3))
+    top_fraction = float(selection_policy.get("top_fraction", 0.6))
+    random_parent_probability = float(selection_policy.get("random_parent_probability", 0.15))
+
+    selected_parents: List[Dict[str, Any]] = []
+
     # Select parents according to strategy
     if strategy in ("modification", "simplification"):
-        # Single-parent strategies: select one parent randomly
-        parent = random.choice(population)
+        parent = _select_parent_by_fitness(
+            population,
+            tournament_size=tournament_size,
+            top_fraction=top_fraction,
+            random_parent_probability=random_parent_probability,
+        )
+        selected_parents = [parent]
         # Call the prompt function with the single parent
         system_prompt, user_prompt = prompt_fn(parent)
     elif strategy == "exploration":
         # Exploration: select two parents if possible, else select as many as available (at least 2 was required).
         k = 2 if len(population) >= 2 else len(population)
-        parents = random.sample(population, k=k)
+        parents = _select_parents_by_fitness(
+            population,
+            k,
+            tournament_size=tournament_size,
+            top_fraction=top_fraction,
+            random_parent_probability=random_parent_probability,
+        )
+        selected_parents = parents
         system_prompt, user_prompt = prompt_fn(parents)
     else:
         # Defensive: should not happen given earlier check, but keep consistent error
@@ -230,6 +348,23 @@ def orchestrate_parent_selection_and_prompt_preparation(
 
     resolved_model = model if model is not None else get_llm_settings().model
     payload = construct_api_request_payload(system_prompt, user_prompt, model=resolved_model)
+    if return_metadata:
+        parent_scores = [_combined_score_of(parent) for parent in selected_parents]
+        return {
+            "payload": payload,
+            "selection": {
+                "strategy": strategy,
+                "parent_scores": parent_scores,
+                "parent_best_score": max(parent_scores) if parent_scores else None,
+                "parents": [_parent_summary(parent) for parent in selected_parents],
+                "parent_selection_policy": {
+                    "mode": "fitness_tournament",
+                    "tournament_size": tournament_size,
+                    "top_fraction": top_fraction,
+                    "random_parent_probability": random_parent_probability,
+                },
+            },
+        }
     return payload
 
 
